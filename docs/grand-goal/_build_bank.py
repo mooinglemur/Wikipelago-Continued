@@ -32,8 +32,8 @@ BANK_EXTRA: dict[str, dict[str, str]] = {
         "fact": "Lou Montulli / Netscape, 1994; client-side state between HTTP requests.",
     },
     "Tuberculosis": {
-        "question": "Which infectious disease, historically called consumption, is caused by Mycobacterium tuberculosis and usually attacks the lungs?",
-        "fact": "Mycobacterium tuberculosis; historically consumption; typically pulmonary.",
+        "question": "Which infectious disease, historically called consumption, is caused by a bacterium of the genus Mycobacterium and usually attacks the lungs?",
+        "fact": "Bacterium of the genus Mycobacterium; historically consumption; typically pulmonary.",
     },
 }
 

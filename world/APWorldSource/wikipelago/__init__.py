@@ -1,17 +1,16 @@
 ﻿from __future__ import annotations
 
-import re
 from typing import Any
 
 from BaseClasses import Item, ItemClassification, Location
 from worlds.AutoWorld import WebWorld, World
 from worlds.generic.Rules import set_rule
 
-from .Items import TRAP_ITEM_NAMES, item_table
+from .Items import PORTAL_ITEM_BY_TOPIC, PORTAL_ITEM_NAMES, TRAP_ITEM_NAMES, item_table
 from .Locations import MAX_BINGO_BOARDS, MAX_BRANCHES, MAX_BRANCH_LENGTH, branch_location_name, location_table
-from .Options import WikipelagoOptions
+from .Options import WikipelagoOptions, wikipelago_option_groups
 from .Regions import create_regions
-from .article_pool import SUPPORTED_LANGS, is_blocked_wiki_title, load_article_pool
+from .article_pool import SUPPORTED_LANGS, is_usable_title, load_article_pool
 from .grand_goal import pick_grand_goal_card
 from .letter_pairs import (
     bingo_location_count,
@@ -32,137 +31,6 @@ WIKIPEDIA_LANG_BY_OPTION: dict[int, str] = {
     8: "pl",
 }
 
-BANNED_TITLE_KEYWORDS: tuple[str, ...] = (
-    "rifle",
-    "pistol",
-    "shotgun",
-    "revolver",
-    "machine gun",
-    "submachine gun",
-    "discography",
-    "chemistry",
-    "chemical",
-    "compound",
-    "acid",
-    "molecule",
-    "molecular",
-    "atom",
-    "isotope",
-    "reaction",
-    "periodic table",
-    "organic chemistry",
-    "inorganic chemistry",
-)
-
-BANNED_TITLE_SUFFIXES: tuple[str, ...] = (
-    "(programming language)",
-    "(operating system)",
-    "(software)",
-    "(computer)",
-)
-
-TOPIC_KEYWORDS: dict[str, tuple[str, ...]] = {
-    "video_games": (
-        "video game", "minecraft", "fortnite", "roblox", "legend of zelda", "Pokémon", "dark souls",
-        "elden ring", "halo", "mario", "baldur's gate", "stardew valley", "hollow knight", "celeste",
-        "among us", "tetris", "call of duty", "resident evil", "final fantasy", "metroid", "portal",
-        "god of war", "mass effect", "bioshock", "terraria", "balatro", "slay the spire",
-    ),
-    "movies": (
-        "(film)", " film", "movie", "star wars", "the dark knight", "the matrix", "lord of the rings",
-        "avengers", "jurassic park", "toy story", "inception", "interstellar", "dune", "oppenheimer",
-        "barbie", "gladiator", "titanic", "moana", "frozen", "coco",
-    ),
-    "tv_shows": (
-        "(tv series)", "television series", "tv series", "television show", "breaking bad",
-        "stranger things", "game of thrones", "the simpsons", "spongebob", "avatar: the last airbender",
-        "friends", "the office", "better call saul", "bluey", "arcane", "house of the dragon",
-        "community", "futurama", "gilmore girls", "glee", "hannibal", "heartstopper", "mr. robot",
-        "ozark", "scrubs", "suits", "supernatural", "the good place", "the x-files",
-    ),
-    "anime_manga": (
-        "anime", "manga", "naruto", "one piece", "dragon ball", "attack on titan", "death note",
-        "demon slayer", "jujutsu kaisen", "my hero academia", "fullmetal alchemist", "bleach",
-    ),
-    "sports": (
-        "football", "basketball", "baseball", "soccer", "tennis", "olympic", "fifa", "nba", "nfl",
-        "champions league", "world cup", "formula one", "golf", "cricket", "wwe", "super bowl",
-        "wimbledon", "tour de france",
-    ),
-    "science_space": (
-        "astronomy", "planet", "galaxy", "black hole", "physics", "biology", "mathematics",
-        "space telescope", "apollo", "mars", "milky way", "quantum", "relativity", "dna", "fossil",
-        "solar system", "international space station",
-    ),
-    "technology": (
-        "internet", "computer", "software", "website", "youtube", "google", "wikipedia", "smartphone",
-        "artificial intelligence", "virtual reality", "social media", "web browser", "operating system",
-        "world wide web", "openai", "mozilla firefox", "google chrome", "microsoft edge",
-    ),
-    "history": (
-        # Avoid bare "war" — false-positives game titles (Warcraft, Gears of War, etc.).
-        "ancient", "history of", "renaissance", "industrial revolution", "middle ages",
-        "roman empire", "world war", "cold war", "silk road", "black death", "moon landing",
-        "ancient egypt", "ancient greece",
-    ),
-    "geography": (
-        "mountain", "river", "desert", "ocean", "national park", "country", "continent",
-        "waterfall", "island", "volcano", "forest", "landmark", "amazon rainforest", "mount everest",
-        "eiffel tower", "taj mahal",
-    ),
-    "food_cuisine": (
-        # Avoid short substrings "dish"/"tea"/"sushi" — false-positives Dishonored, Steam, Tsushima.
-        "cuisine", "food", "pizza", "pasta", "burger", "taco", "ramen",
-        "chocolate", "coffee", "ice cream", "sandwich",
-    ),
-    "art_literature": (
-        "novel", "book", "author", "poetry", "painting", "sculpture", "museum", "theater",
-        "literature", "shakespeare", "mona lisa", "van gogh", "picasso", "harry potter",
-        "the hobbit", "pride and prejudice",
-    ),
-    "mythology_folklore": (
-        # Avoid short substrings like "legend"/"dragon"/"myth"/"vampire" — they false-positive
-        # game/show titles (League of Legends, Dragon Age, Age of Mythology, etc.).
-        "mythology", "folklore", "greek god", "norse", "werewolf", "mermaid",
-        "odin", "zeus", "athena",
-    ),
-    "music": (
-        "musician", "singer", "rapper", "composer", "orchestra", "symphony",
-        "grammy", "billboard", "album", "discography", "hip hop", "jazz",
-        "rock music", "pop music", "classical music", "the beatles", "taylor swift",
-    ),
-}
-
-EXACT_TITLE_TOPICS: dict[str, str] = {
-    "super bowl": "sports",
-    "the matrix": "movies",
-    "breaking bad": "tv_shows",
-    "stranger things": "tv_shows",
-    "friends": "tv_shows",
-    "spongebob squarepants": "tv_shows",
-    "the simpsons": "tv_shows",
-    "game of thrones": "tv_shows",
-    "avatar: the last airbender": "tv_shows",
-    "bluey": "tv_shows",
-    "naruto": "anime_manga",
-    "one piece": "anime_manga",
-    "death note": "anime_manga",
-    "attack on titan": "anime_manga",
-    "chess": "miscellaneous",
-    "checkers": "miscellaneous",
-    "catan": "miscellaneous",
-    "go": "miscellaneous",
-    "minecraft": "video_games",
-    "fortnite": "video_games",
-    "roblox": "video_games",
-    "dark souls": "video_games",
-    "elden ring": "video_games",
-    "halo: combat evolved": "video_games",
-    "wikipedia": "technology",
-    "google": "technology",
-    "youtube": "technology",
-}
-
 SEARCH_STARTING_LETTERS: dict[int, set[str]] = {
     0: set(),
     1: {"A", "E", "I", "O", "U"},
@@ -171,10 +39,69 @@ SEARCH_STARTING_LETTERS: dict[int, set[str]] = {
 }
 
 SCROLL_SPEED_UPGRADES = 5
+REALM_REROLL_POOL_MAX = 300
+
+# Universal Tracker regeneration (see _load_ut_slot_data). Top-level slot_data fields named
+# like their option: each holds the option's value, or a capped / zeroed value with the same
+# effect on generation (1.1.0 seeds only have these).
+UT_SLOT_DATA_FIELDS: tuple[str, ...] = (
+    "check_count",
+    "required_fragments",
+    "start_rounds_unlocked",
+    "rounds_per_unlock",
+    "wikipedia_language",
+    "goal",
+    "searchsanity",
+    "scrollsanity",
+    "randomize_tables",
+    "randomize_pictures",
+    "randomize_incipit",
+    "randomize_infoboxes",
+    "randomize_toc",
+    "randomize_navboxes",
+    "randomize_hatnotes",
+    "randomize_references",
+    "deaths",
+    "death_link",
+    "link_bombs",
+    "link_bomb_density",
+    "trap_count",
+    "trap_type",
+    "trap_link",
+    "bingo_letterpairs_grid",
+    "bingo_cards_start",
+    "bingo_card_unlocks",
+    "bingo_stamp_unlocks",
+    "back_depth_start",
+    "back_depth_unlocks",
+    "target_rerolls_start",
+    "target_reroll_unlocks",
+    "branch_count",
+    "branch_length",
+    "additional_branch_keys",
+    "topic_portals",
+)
+
+# Options whose YAML value is missing from those fields (capped, zeroed when unused or not
+# sent at all). slot_data["options"] carries them so a regeneration matches the real seed.
+UT_SLOT_DATA_OPTIONS: tuple[str, ...] = (
+    "required_fragments",
+    "additional_fragments_in_pool",
+    "start_rounds_unlocked",
+    "search_starting_letters",
+    "bingo_letterpairs_grid",
+    "bingo_cards_start",
+    "bingo_card_unlocks",
+    "bingo_stamp_unlocks",
+    "branch_length",
+    "additional_branch_keys",
+    "topic_portals",
+)
 
 
 class WikipelagoWeb(WebWorld):
     theme = "stone"
+    option_groups = wikipelago_option_groups
 
 
 class WikipelagoItem(Item):
@@ -196,10 +123,14 @@ class WikipelagoWorld(World):
     location_name_to_id = {name: data.code for name, data in location_table.items()}
     item_name_groups = {
         "Traps": set(TRAP_ITEM_NAMES),
+        "Portals": set(PORTAL_ITEM_NAMES),
     }
 
     item_class = WikipelagoItem
     location_class = WikipelagoLocation
+
+    # Universal Tracker: rebuild the slot from slot_data alone (no YAML needed).
+    ut_can_gen_without_yaml = True
 
     round_pairs: list[dict[str, str]]
     goal_article: str
@@ -209,6 +140,18 @@ class WikipelagoWorld(World):
     bingo_letterpairs_boards: list[list[list[str]]]
     crossroads: list[dict[str, int]]
     branches: list[dict[str, Any]]
+    trap_item_counts: dict[str, int]
+    ut_trap_item_counts: dict[str, int] | None = None
+
+    @staticmethod
+    def interpret_slot_data(slot_data: dict[str, Any]) -> dict[str, Any]:
+        # Returning the slot_data makes Universal Tracker regenerate with it as re_gen_passthrough.
+        return slot_data
+
+    def get_filler_item_name(self) -> str:
+        # Core asks for filler for item links and when plando / fill need extra items;
+        # the default would pick any item (Victory, Round Access, a trap...).
+        return "Footnote"
 
     def _bingo_enabled(self) -> bool:
         return bool(self.options.toggle_bingo_letterpairs.value)
@@ -254,60 +197,8 @@ class WikipelagoWorld(World):
             return 0
         return bingo_location_count(grid_size) * self._bingo_board_count()
 
-    @staticmethod
-    def _is_reasonable_title(title: str) -> bool:
-        if len(title) < 3 or len(title) > 120:
-            return False
-        if "$" in title:
-            return False
-        if not re.search(r"[A-Za-z]", title):
-            return False
-        if re.search(r"^[^A-Za-z0-9]+$", title):
-            return False
-        return True
-
-    @staticmethod
-    def _looks_common_knowledge(title: str) -> bool:
-        if is_blocked_wiki_title(title):
-            return False
-        lowered = title.lower().strip()
-        if lowered.startswith(("list of ", "outline of ", "timeline of ", "index of ")):
-            return False
-        if any(keyword in lowered for keyword in BANNED_TITLE_KEYWORDS):
-            return False
-        if any(lowered.endswith(suffix) for suffix in BANNED_TITLE_SUFFIXES):
-            return False
-        if any(ch in title for ch in ('"', "$", "%", "@", "#")):
-            return False
-        if title.count(",") > 2:
-            return False
-        if re.search(r"\(disambiguation|magazine|journal\)$", lowered):
-            return False
-        if len(title.split()) > 12:
-            return False
-        return True
-
     def _wikipedia_language(self) -> str:
         return WIKIPEDIA_LANG_BY_OPTION.get(int(self.options.wikipedia_language.value), "en")
-
-    def _infer_topic(self, title: str) -> str | None:
-        """Fallback topic for goal presets not found in the annotated pool."""
-        lowered = title.lower().strip()
-        exact_match = EXACT_TITLE_TOPICS.get(lowered)
-        if exact_match:
-            return exact_match
-        if "(film)" in lowered:
-            return "movies"
-        if "(tv series)" in lowered or "television series" in lowered:
-            return "tv_shows"
-        if "(video game)" in lowered:
-            return "video_games"
-        if re.search(r"\((song|album|single|band|musician|rapper|singer)\)$", lowered):
-            return "music"
-        for topic, keywords in TOPIC_KEYWORDS.items():
-            if any(keyword in lowered for keyword in keywords):
-                return topic
-        return "miscellaneous"
 
     def _selected_topics(self) -> set[str]:
         selected: set[str] = set()
@@ -366,15 +257,29 @@ class WikipelagoWorld(World):
     def _branch_length(self) -> int:
         return max(1, min(int(self.options.branch_length.value), MAX_BRANCH_LENGTH))
 
+    def _topic_portals(self) -> bool:
+        return bool(self.options.topic_portals.value) and self._branch_count() > 0
+
+    def _goal_is_grand_goal(self) -> bool:
+        return int(self.options.goal.value) == 0
+
+    def _goal_name(self) -> str:
+        return "grand_goal" if self._goal_is_grand_goal() else "realm_master"
+
     def _additional_branch_keys(self) -> int:
-        if self._branch_count() <= 0:
+        if self._branch_count() <= 0 or self._topic_portals():
             return 0
         return max(0, int(self.options.additional_branch_keys.value))
 
     def _branch_key_count(self) -> int:
-        if self._branch_count() <= 0:
+        if self._branch_count() <= 0 or self._topic_portals():
             return 0
         return self._branch_count() + self._additional_branch_keys()
+
+    def _required_fragments(self) -> int:
+        if not self._goal_is_grand_goal():
+            return 0
+        return min(self.options.required_fragments.value, self.options.check_count.value)
 
     def _branch_location_count(self) -> int:
         return self._branch_count() * self._branch_length()
@@ -406,7 +311,58 @@ class WikipelagoWorld(World):
             unlocks.append("Reference Lens")
         return unlocks
 
+    def _realms_need_crossroad(self) -> bool:
+        """Grand Goal games open a Realm with its Portal (or keys) plus its crossroad round;
+        Realm Master games with the Portal (or keys) alone, so Realms don't wait on the main road."""
+        ut_slot_data = self._ut_slot_data()
+        if ut_slot_data is not None:
+            # 1.1.0 seeds carry no flag: they always needed the crossroad.
+            return bool(ut_slot_data.get("realms_need_crossroad", True))
+        return self._goal_is_grand_goal()
+
+    def _ut_slot_data(self) -> dict[str, Any] | None:
+        """The real seed's slot_data while Universal Tracker regenerates this slot, else None."""
+        passthrough = getattr(self.multiworld, "re_gen_passthrough", None)
+        if not isinstance(passthrough, dict):
+            return None
+        slot_data = passthrough.get(self.game)
+        return slot_data if isinstance(slot_data, dict) else None
+
+    def _load_ut_slot_data(self, slot_data: dict[str, Any]) -> None:
+        """Universal Tracker: take the options and every roll from the real seed's slot_data,
+        so regions, items, locations and rules match it whatever YAML (if any) UT has."""
+        values = {name: slot_data[name] for name in UT_SLOT_DATA_FIELDS if name in slot_data}
+        if "bingo_letterpairs" in slot_data:
+            values["toggle_bingo_letterpairs"] = slot_data["bingo_letterpairs"]
+        values.update(slot_data.get("options") or {})
+        for name, value in values.items():
+            option = getattr(self.options, name, None)
+            if option is None:
+                continue
+            try:
+                setattr(self.options, name, option.from_any(value))
+            except Exception:
+                # A zeroed field from a 1.1.0 seed can be outside the YAML range
+                # (branch_length 0 without branches); the option is unused then.
+                continue
+        self.goal_article = str(slot_data.get("goal_article") or "")
+        self.goal_question = str(slot_data.get("goal_question") or "")
+        self.goal_qid = slot_data.get("goal_qid") or None
+        self.round_pairs = list(slot_data.get("round_pairs") or [])
+        self.crossroads = list(slot_data.get("crossroads") or [])
+        self.branches = list(slot_data.get("branches") or [])
+        self.reroll_pool = list(slot_data.get("reroll_pool") or [])
+        self.bingo_letterpairs_boards = list(slot_data.get("bingo_letterpairs_boards") or [])
+        trap_counts = slot_data.get("trap_item_counts")
+        if isinstance(trap_counts, dict):
+            self.ut_trap_item_counts = {str(name): int(count) for name, count in trap_counts.items()}
+
     def generate_early(self) -> None:
+        ut_slot_data = self._ut_slot_data()
+        if ut_slot_data is not None:
+            self._load_ut_slot_data(ut_slot_data)
+            return
+
         round_count = self.options.check_count.value
         selected_topics = self._selected_topics()
         if not selected_topics:
@@ -428,8 +384,7 @@ class WikipelagoWorld(World):
         filtered_entries = [
             entry
             for entry in article_entries
-            if self._is_reasonable_title(entry["title"])
-            and self._looks_common_knowledge(entry["title"])
+            if is_usable_title(entry["title"], lang)
             and self._entry_matches(entry, selected_topics, include_sensitive)
         ]
         # Preserve order, drop dupes.
@@ -445,6 +400,11 @@ class WikipelagoWorld(World):
 
         branch_count = self._branch_count()
         branch_length = self._branch_length()
+        if not self._goal_is_grand_goal() and branch_count <= 0:
+            raise Exception(
+                "Wikipelago goal realm_master needs at least one branch / Realm: "
+                "set branch_count to 1 or more, or use goal: grand_goal."
+            )
         if branch_count > 0 and round_count < 2:
             raise Exception(
                 "Wikipelago cannot generate branches: check_count must be at least 2 "
@@ -474,30 +434,30 @@ class WikipelagoWorld(World):
                 "Lower check_count / branch_count / branch_length or enable more article categories."
             )
 
+        self.goal_article = ""
         self.goal_question = ""
         self.goal_qid = None
-        lang = self._wikipedia_language()
-        # random_goal_article / goal_article_preset are kept so old YAMLs still
-        # parse; generate always picks from this wiki language's goal pool.
-        try:
-            card = pick_grand_goal_card(
-                self.random,
-                lang,
-                selected_topics,
-                filtered_pool,
-                include_sensitive=include_sensitive,
-                sensitive_titles=sensitive_titles,
-            )
-        except FileNotFoundError:
-            card = None
-        if card:
-            self.goal_article = card["answer_title"]
-            self.goal_question = card["question"]
-            self.goal_qid = card.get("qid")
-        else:
-            self.goal_article = self.random.choice(filtered_pool)
-        if self.goal_article not in filtered_pool:
-            filtered_pool.append(self.goal_article)
+        if self._goal_is_grand_goal():
+            # Always from this wiki language's goal pool.
+            try:
+                card = pick_grand_goal_card(
+                    self.random,
+                    lang,
+                    selected_topics,
+                    filtered_pool,
+                    include_sensitive=include_sensitive,
+                    sensitive_titles=sensitive_titles,
+                )
+            except FileNotFoundError:
+                card = None
+            if card:
+                self.goal_article = card["answer_title"]
+                self.goal_question = card["question"]
+                self.goal_qid = card.get("qid")
+            else:
+                self.goal_article = self.random.choice(filtered_pool)
+            if self.goal_article not in filtered_pool:
+                filtered_pool.append(self.goal_article)
 
         remaining = [title for title in filtered_pool if title != self.goal_article]
         # Opening start + one target per round + branch_length extra titles per branch.
@@ -519,25 +479,42 @@ class WikipelagoWorld(World):
             {"start": start, "target": target}
             for start, target in zip(starts, targets)
         ]
-        used_titles = {first_start, *targets, self.goal_article}
+        used_titles = {first_start, *targets}
+        if self.goal_article:
+            used_titles.add(self.goal_article)
 
         self.crossroads = []
         self.branches = []
+        topic_portals = self._topic_portals()
         if branch_count > 0:
             eligible_rounds = list(range(2, round_count + 1))
             chosen_rounds = sorted(self.random.sample(eligible_rounds, branch_count))
             leftover = [title for title in remaining if title not in used_titles]
+            used_themes: set[str] = set()
             for branch_id, main_round in enumerate(chosen_rounds):
                 fork = self.round_pairs[main_round - 1]["target"]
-                tagged_pools: dict[str, list[str]] = {tag: [] for tag in selected_topics}
+                # Sorted: set order changes with Python's hash seed, so the same seed could pick other themes.
+                tagged_pools: dict[str, list[str]] = {tag: [] for tag in sorted(selected_topics)}
                 for title in leftover:
                     for tag in title_to_tags.get(title, ()):
                         if tag in tagged_pools:
                             tagged_pools[tag].append(title)
                 viable = [tag for tag, titles in tagged_pools.items() if len(titles) >= branch_length]
+                if topic_portals:
+                    # Realms: one distinct topic each, so every Realm has its own Portal.
+                    viable = sorted(tag for tag in viable if tag not in used_themes and tag in PORTAL_ITEM_BY_TOPIC)
+                    if not viable:
+                        raise Exception(
+                            "Wikipelago cannot generate Topic Realms: "
+                            f"Realm {branch_id + 1} of {branch_count} has no unused enabled category "
+                            f"with {branch_length} spare articles. "
+                            "Lower branch_count / branch_length, enable more include_* categories, "
+                            "or turn topic_portals off."
+                        )
                 if viable:
                     theme_tag = self.random.choice(viable)
                     theme_titles = tagged_pools[theme_tag]
+                    used_themes.add(theme_tag)
                 else:
                     theme_tag = self.random.choice(sorted(selected_topics))
                     theme_titles = leftover
@@ -557,14 +534,25 @@ class WikipelagoWorld(World):
                 used_titles.update(branch_targets)
                 leftover = [title for title in leftover if title not in used_titles]
                 self.crossroads.append({"main_round": main_round, "branch_id": branch_id})
-                self.branches.append({
+                branch: dict[str, Any] = {
                     "id": branch_id,
                     "theme_tag": theme_tag,
                     "pairs": pairs,
-                })
+                }
+                if topic_portals:
+                    branch["portal_item"] = PORTAL_ITEM_BY_TOPIC[theme_tag]
+                self.branches.append(branch)
 
         # Leftover titles for client-side target rerolls (same filtered category pool).
         self.reroll_pool = [title for title in filtered_pool if title not in used_titles]
+        if topic_portals:
+            # Realm rerolls stay on topic: each Realm gets its own slice of the reroll pool.
+            for branch in self.branches:
+                tag = branch["theme_tag"]
+                on_topic = [title for title in self.reroll_pool if tag in title_to_tags.get(title, ())]
+                if len(on_topic) > REALM_REROLL_POOL_MAX:
+                    on_topic = self.random.sample(on_topic, REALM_REROLL_POOL_MAX)
+                branch["reroll_pool"] = on_topic
 
         if self._bingo_enabled():
             grid_size = self._bingo_grid_size()
@@ -593,9 +581,13 @@ class WikipelagoWorld(World):
         bingo_count = self._bingo_check_count()
         branch_loc_count = self._branch_location_count()
         free_locations = round_count + bingo_count + branch_loc_count
-        required_fragments = min(self.options.required_fragments.value, round_count)
-        additional_fragments = max(0, int(self.options.additional_fragments_in_pool.value))
+        required_fragments = self._required_fragments()
+        if self._goal_is_grand_goal():
+            additional_fragments = max(0, int(self.options.additional_fragments_in_pool.value))
+        else:
+            additional_fragments = 0
         fragment_pool_count = required_fragments + additional_fragments
+        portal_items = [str(branch["portal_item"]) for branch in self.branches if branch.get("portal_item")]
         start_unlocked = min(self.options.start_rounds_unlocked.value, round_count)
         per_unlock = max(1, self.options.rounds_per_unlock.value)
         early_open = start_unlocked
@@ -619,6 +611,7 @@ class WikipelagoWorld(World):
             + bingo_stamp_unlocks
             + round_access_count
             + branch_keys
+            + len(portal_items)
             + search_letters_needed
             + scroll_upgrades_needed
             + len(display_unlocks)
@@ -660,21 +653,32 @@ class WikipelagoWorld(World):
             pool.append(self.create_item("Round Access"))
         for _ in range(branch_keys):
             pool.append(self.create_item("Branch Key"))
-        for trap_name in self._trap_item_names(trap_count):
+        for portal_name in portal_items:
+            pool.append(self.create_item(portal_name))
+        trap_names = self._trap_item_names(trap_count)
+        self.trap_item_counts = {name: trap_names.count(name) for name in TRAP_ITEM_NAMES}
+        for trap_name in trap_names:
             pool.append(self.create_item(trap_name))
         while len(pool) < free_locations:
             pool.append(self.create_item("Footnote"))
 
         self.multiworld.itempool.extend(pool)
-        # Grand Goal is checkable (real location id) so it must hold a real item code for hosting.
-        # Victory stays locked / unshuffled — nothing useful for the multiworld; clearing goal still
-        # completes the slot via the bridge CLIENT_GOAL. Remaining checks follow room release settings.
-        grand_goal = self.multiworld.get_location("Grand Goal", self.player)
-        grand_goal.place_locked_item(self.create_item("Victory"))
+        if self._goal_is_grand_goal():
+            # Grand Goal is checkable (real location id) so it must hold a real item code for hosting.
+            # Victory stays locked / unshuffled — nothing useful for the multiworld; clearing goal still
+            # completes the slot via the bridge CLIENT_GOAL. Remaining checks follow room release settings.
+            grand_goal = self.multiworld.get_location("Grand Goal", self.player)
+            grand_goal.place_locked_item(self.create_item("Victory"))
+        else:
+            goal_complete = self.multiworld.get_location("Goal Complete", self.player)
+            goal_complete.place_locked_item(self.create_event("Victory"))
 
     def _trap_item_names(self, trap_count: int) -> list[str]:
         if trap_count <= 0:
             return []
+        if self.ut_trap_item_counts is not None:
+            # Universal Tracker: the real seed's trap mix instead of a new roll.
+            return [name for name in TRAP_ITEM_NAMES for _ in range(self.ut_trap_item_counts.get(name, 0))]
         trap_type = int(self.options.trap_type.value)
         if trap_type == 1:
             return ["Foggy Links"] * trap_count
@@ -690,13 +694,25 @@ class WikipelagoWorld(World):
 
     def set_rules(self) -> None:
         round_count = self.options.check_count.value
-        required_fragments = min(self.options.required_fragments.value, round_count)
+        branch_count = self._branch_count()
 
-        goal_location = self.multiworld.get_location("Grand Goal", self.player)
-        set_rule(
-            goal_location,
-            lambda state, frag_need=required_fragments: state.has("Knowledge Fragment", self.player, frag_need),
-        )
+        if self._goal_is_grand_goal():
+            goal_location = self.multiworld.get_location("Grand Goal", self.player)
+            set_rule(
+                goal_location,
+                lambda state, frag_need=self._required_fragments(): state.has(
+                    "Knowledge Fragment", self.player, frag_need
+                ),
+            )
+        else:
+            goal_location = self.multiworld.get_location("Goal Complete", self.player)
+            realm_regions = [f"Branch {branch}" for branch in range(1, branch_count + 1)]
+            set_rule(
+                goal_location,
+                lambda state, regions=realm_regions: all(
+                    state.can_reach_region(region, self.player) for region in regions
+                ),
+            )
 
         for round_index in range(1, round_count + 1):
             location = self.multiworld.get_location(f"Round {round_index} Complete", self.player)
@@ -722,19 +738,35 @@ class WikipelagoWorld(World):
                         ),
                     )
 
-        branch_count = self._branch_count()
         if branch_count > 0:
             # branch_id is assigned in main_round order in generate_early, matching
-            # client FIFO: Branch N needs N keys and the Round Access of its crossroad.
+            # client FIFO: Branch N needs N keys and (Grand Goal) the Round Access of its crossroad.
+            need_crossroad = self._realms_need_crossroad()
             crossroad_round_by_branch = {
                 int(cr["branch_id"]) + 1: int(cr["main_round"])
                 for cr in (getattr(self, "crossroads", None) or [])
             }
+            portal_by_branch = {
+                int(branch["id"]) + 1: str(branch["portal_item"])
+                for branch in self.branches
+                if branch.get("portal_item")
+            }
             for branch in range(1, branch_count + 1):
                 keys_needed = branch
                 main_round = crossroad_round_by_branch.get(branch)
-                need_ra = self._round_access_needed(main_round) if main_round else 0
+                need_ra = self._round_access_needed(main_round) if (main_round and need_crossroad) else 0
                 entrance = self.multiworld.get_entrance(f"To Branch {branch}", self.player)
+                portal = portal_by_branch.get(branch)
+                if portal:
+                    # Topic Realms: own Portal (+ reaching the crossroad in Grand Goal games); no FIFO key count.
+                    set_rule(
+                        entrance,
+                        lambda state, portal=portal, need_ra=need_ra: (
+                            state.has(portal, self.player)
+                            and (need_ra <= 0 or state.has("Round Access", self.player, need_ra))
+                        ),
+                    )
+                    continue
                 set_rule(
                     entrance,
                     lambda state, need_keys=keys_needed, need_ra=need_ra: (
@@ -747,7 +779,7 @@ class WikipelagoWorld(World):
 
     def fill_slot_data(self) -> dict[str, Any]:
         round_count = self.options.check_count.value
-        required_fragments = min(self.options.required_fragments.value, round_count)
+        required_fragments = self._required_fragments()
         start_unlocked = min(self.options.start_rounds_unlocked.value, round_count)
         per_unlock = max(1, self.options.rounds_per_unlock.value)
         round_location_ids = [
@@ -766,8 +798,9 @@ class WikipelagoWorld(World):
         target_reroll_unlocks = max(0, int(self.options.target_reroll_unlocks.value))
         location_ids: dict[str, Any] = {
             "rounds": round_location_ids,
-            "grand_goal": self.location_name_to_id["Grand Goal"],
         }
+        if self._goal_is_grand_goal():
+            location_ids["grand_goal"] = self.location_name_to_id["Grand Goal"]
         if bingo_enabled:
             location_ids["bingo_letterpairs"] = bingo_slot_location_ids_by_board(
                 self.location_name_to_id, bingo_grid, len(bingo_boards)
@@ -784,6 +817,9 @@ class WikipelagoWorld(World):
             ]
 
         return {
+            "goal": self._goal_name(),
+            "topic_portals": self._topic_portals(),
+            "realms_need_crossroad": self._realms_need_crossroad(),
             "check_count": round_count,
             "required_fragments": required_fragments,
             "start_rounds_unlocked": start_unlocked,
@@ -830,6 +866,9 @@ class WikipelagoWorld(World):
             "target_reroll_unlocks": target_reroll_unlocks,
             "location_ids": location_ids,
             "item_ids": {name: data.code for name, data in item_table.items()},
+            # For Universal Tracker regeneration (_load_ut_slot_data); the bridge ignores them.
+            "trap_item_counts": dict(getattr(self, "trap_item_counts", {}) or {}),
+            "options": self.options.as_dict(*UT_SLOT_DATA_OPTIONS),
         }
 
 

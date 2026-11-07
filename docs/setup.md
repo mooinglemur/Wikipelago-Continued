@@ -4,7 +4,7 @@
 
 ### Host / organizer (generates the seed)
 
-- [Archipelago](https://github.com/ArchipelagoMW/Archipelago/releases) **0.6.7** or compatible
+- [Archipelago](https://github.com/ArchipelagoMW/Archipelago/releases) **0.6.7 or newer**
 - `wikipelago.apworld` from this repo’s [Releases](https://github.com/Dreskn/Wikipelago-Continued/releases)
 - Player YAML files (template also on Releases, or [`yaml/Wikipelago.yaml`](../yaml/Wikipelago.yaml))
 
@@ -61,14 +61,14 @@ Use this when the Archipelago room is reachable from the public internet (`archi
 5. Play available rounds: Start → Target by clicking Wikipedia links.
 6. Collect Knowledge Fragments to unlock the Grand Goal question, then find the answer page.
 
-**Practice** (no room needed) uses the same client and a random article pool in the UI language. It does not connect to Archipelago and does not send checks.
+**Practice** (no room needed) uses the same client and a random article pool in the UI language, with a 5×5 bingo board and one open Realm to try those too. It does not connect to Archipelago and does not send checks.
 
 ### Option 2 — Local client (private / VPN rooms)
 
-The hosted site talks to Archipelago **from a public server**. If the room only exists on a LAN, Tailscale, or another private network, that server cannot reach it. Run the same web client on a computer that *can* see the room (usually a PC already on that VPN).
+The hosted site talks to Archipelago **from a public server**. If the room only exists on a LAN, Tailscale, or another private network, that server cannot reach it, and it refuses private addresses (`localhost`, `192.168.x.x`, `10.x.x.x`, Tailscale `100.x.x.x`, ...) on purpose. Run the same web client on a computer that *can* see the room (usually a PC already on that VPN).
 
-1. Install [Python 3](https://www.python.org/downloads/) from python.org. Tick **Add python.exe to PATH** and the **py** launcher. Microsoft Store Python often fails the starter script.
-2. Get this repository at the **same version as the apworld**: the Source code zip on that [Release](https://github.com/Dreskn/Wikipelago-Continued/releases), or `git clone` and check out the matching tag.
+1. Install [Python](https://www.python.org/downloads/) **3.10 or newer** from python.org. Tick **Add python.exe to PATH** and the **py** launcher. Microsoft Store Python often fails the starter script.
+2. Get this repository at the **same version as the apworld**, or its latest client-only patch (for example `1.1.1b` for the 1.1.1 apworld): the Source code zip on that [Release](https://github.com/Dreskn/Wikipelago-Continued/releases), or `git clone` and check out the matching tag.
 3. Open the `bridge` folder. First time: double-click `setup_and_start_bridge.bat`. Later: `start_bridge.bat`. Leave that window open.
 4. If it says it cannot find Python, in that same `bridge` folder run:
    ```
@@ -84,8 +84,9 @@ That computer must stay on while you play. Other players on the same LAN/VPN can
 ### Tips
 
 - Only in-article wiki link clicks count toward checks.
-- Hover the Target title for a short description of that page.
-- **Journey** (on the Progression card, once you are in a game) shows the path of pages you have visited.
+- Hover the Target title (or tap it on a touch screen) for a short description of that page.
+- **Journey** (on the Progression card, once you are in a game) shows the path of pages you have visited. Hover a point for its summary, and click it to open that page on Wikipedia ([more](overview.md#journey)).
+- On a phone, the menu button in the bar at the top of the screen switches between the article and the cards ([phone layout](overview.md#on-a-phone)).
 - Side cards have a small hide control on the header if you want more room for the article.
 - If the badge says **Offline**, you are no longer attached to the room — reconnect with the same slot; the client will try to resume. Prefer finishing a round before closing the tab when possible.
 - File / Template / Wikipedia-namespace pages are blocked on purpose; pick another link.
@@ -96,9 +97,9 @@ That computer must stay on while you play. Other players on the same LAN/VPN can
 
 | Piece | Version |
 | --- | --- |
-| Wikipelago world (`apworld`) | **1.0.3** |
-| Recommended Archipelago | **0.6.7** |
-| Web client | hosted link above, or local `http://127.0.0.1:5000` from this repo |
+| Wikipelago world (`apworld`) | **1.1.1** |
+| Archipelago | **0.6.7 or newer** |
+| Web client | **1.1.1b**: hosted link above, or local `http://127.0.0.1:5000` from this repo |
 
 The player YAML template pins these via top-level `requires` (`version` + `game.Wikipelago`) so generation fails if the host apworld is too old.
 Hosts and generators should still use a matching apworld for the seed they create.

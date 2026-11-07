@@ -315,8 +315,8 @@ QUESTIONS: list[dict[str, str]] = [
         "fact": "Flattest/driest inhabited continent; includes Tasmania. Not the capital.",
     },
     {
-        "question": "Which messenger, named to sound like 'what's up,' launched in May 2009 and was later bought by Facebook?",
-        "fact": "Name ≈ 'what's up'; launched May 2009; Facebook acquisition.",
+        "question": "Which messenger, founded by two former Yahoo! employees, launched in May 2009 and was later bought by Facebook?",
+        "fact": "Founded by two former Yahoo! employees; launched May 2009; Facebook acquisition.",
     },
     {
         "question": "Which U.S. city is made of five boroughs, each matching a county, and hosts the United Nations headquarters?",
@@ -343,8 +343,8 @@ QUESTIONS: list[dict[str, str]] = [
         "fact": "INES 7; reactor 4; 26 April 1986 safety test.",
     },
     {
-        "question": "Which kind of website takes its name from a Hawaiian word for 'quick,' via the first such site, WikiWikiWeb?",
-        "fact": "Hawaiian 'quick'; WikiWikiWeb as the first example.",
+        "question": "Which kind of collaboratively edited website takes its name, via the first user-editable site, from a Hawaiian word for 'quick'?",
+        "fact": "Collaboratively edited site; name from Hawaiian 'quick' via the first user-editable site.",
     },
     {
         "question": "Which actor wrote and starred in Rocky (1976) and is one of only two to have a box-office number-one film in six consecutive decades?",
@@ -367,7 +367,7 @@ QUESTIONS: list[dict[str, str]] = [
         "fact": "King Jan–Dec 1936; abdicated; later Duke of Windsor.",
     },
     {
-        "question": "Which UEFA club competition began in 1955 as the European Champion Clubs' Cup?",
+        "question": "Which UEFA club competition began in 1955 as the European Cup and was renamed and reformatted in 1992?",
         "fact": "Introduced 1955 as the European Cup.",
     },
     {
@@ -403,7 +403,7 @@ QUESTIONS: list[dict[str, str]] = [
         "fact": "Oscar: Girl, Interrupted; then Lara Croft: Tomb Raider.",
     },
     {
-        "question": "Which BBC service is the world's largest external broadcaster by reach and airs radio in more than 40 languages?",
+        "question": "Which BBC service is the biggest external broadcaster by audience reach and airs radio in more than 40 languages?",
         "fact": "Largest external broadcaster; 40+ languages.",
     },
     {

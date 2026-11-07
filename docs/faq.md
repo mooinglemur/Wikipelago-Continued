@@ -2,7 +2,7 @@
 
 ## How do I report a bug?
 
-On the Archipelago Discord, in the [Wikipelago discussion thread](https://discord.com/channels/731205301247803413/1462007968902938768).
+On [GitHub Issues](https://github.com/Dreskn/Wikipelago-Continued/issues), or on the Archipelago Discord in the [Wikipelago discussion thread](https://discord.com/channels/731205301247803413/1462007968902938768).
 
 ## What does `Wikipelago item math invalid` “required progression items exceed locations” mean?
 
@@ -12,6 +12,20 @@ Fix it by either:
 
 - **Adding locations** — raise `check_count`, and/or enable bingo / use a larger grid / more boards, and/or enable branches
 - **Removing item pressure** — turn down sanities (especially searchsanity), lenses, traps, unlock counts, or ease Round Access (`start_rounds_unlocked` / `rounds_per_unlock`)
+
+## What does `Wikipelago cannot generate Topic Realms` “no unused enabled category” mean?
+
+With `topic_portals` on, every Realm needs its **own** enabled category, and that category needs at least `branch_length` articles the main road has not already used. The error names the first Realm that could not get one.
+
+Fix it by either:
+
+- **Enabling more categories** — turn on more `include_*` toggles (you need at least as many as `branch_count`, and a few spare helps)
+- **Asking for less** — lower `branch_count` and/or `branch_length`
+- **Turning `topic_portals` off** — plain branches can share a category
+
+## What does `goal realm_master needs at least one branch / Realm` mean?
+
+Realm Master is won by clearing every branch / Realm, so a seed with `branch_count: 0` has nothing to clear. Set `branch_count` to 1 or more, or switch back to `goal: grand_goal`.
 
 ## I don't understand how bingo works. How do I stamp a letter pair like FC?
 
@@ -42,6 +56,10 @@ French `é` is just E. Polish `Ź` is not Z. Same idea for the other extras in t
 
 You might get disconnected if the AP room goes to sleep, or if the server deploys a new update. Refresh your page and reconnect with the same server, slot, and password. Checks you already sent are still in Archipelago; you just need the connection again.
 
+## Can I play on a phone?
+
+Yes, in the browser. Below 900 px wide the client switches to a one-column layout: a bar at the top keeps your targets, the Compass hint, search and **SOS** in view, and the menu button swaps the article for the cards and settings. Tap a target to see its preview. See [Overview — On a phone](overview.md#on-a-phone).
+
 ## Why is the Wikipedia language different from the dropdown in the corner?
 
 The dropdown only translates buttons, labels, and toasts. Which Wikipedia you race on is `wikipedia_language` in your YAML (and Practice follows the UI language).
@@ -52,4 +70,8 @@ Non-article namespaces (File, Template, Wikipedia:, Portail, Plik, and the same 
 
 ## What happened to `goal_article_preset` / `random_goal_article`?
 
-They are ignored. The Grand Goal is always a closed question from that wiki language’s goal pool. Old YAMLs still generate; they just no longer pick a preset series.
+They were removed in 1.1.1 (they had been ignored since 1.0). The Grand Goal is always a closed question from that wiki language’s goal pool. Old YAMLs that still contain them generate fine; Archipelago only logs a warning that the option is unknown.
+
+## I picked Realm Master. Where are my Knowledge Fragments and the Grand Goal?
+
+There are none: `goal: realm_master` generates no Knowledge Fragments and no Grand Goal question. The **Realms to master** checklist in the Progression card is your goal tracker (cleared / total). You win when the last round of every Realm is done. If you finish the main road first, the target line reads "Main road cleared — finish your Realms".

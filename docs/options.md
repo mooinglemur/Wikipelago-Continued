@@ -14,7 +14,7 @@ After installing the apworld, you can generate a fresh template from the Archipe
 | Option | Default | What it does |
 | --- | --- | --- |
 | `check_count` | `40` | How many Start → Target rounds (checks) are generated for your slot. |
-| `required_fragments` | `7` | Knowledge Fragments needed before the Grand Goal question is revealed. Landing on the answer page finishes the slot. |
+| `required_fragments` | `7` | Knowledge Fragments needed before the Grand Goal question is revealed. Landing on the answer page finishes the slot. Capped at `check_count`: a higher value needs (and puts in the pool) only `check_count` fragments. |
 | `additional_fragments_in_pool` | `2` | Extra Knowledge Fragments shuffled into the item pool beyond `required_fragments`. Goal still needs only the required count. |
 | `start_rounds_unlocked` | `10` | How many rounds are playable immediately at seed start. |
 | `rounds_per_unlock` | `5` | How many additional rounds each **Round Access** item unlocks. |
@@ -51,6 +51,29 @@ On by default (`branch_count: 2`). Some main-road rounds become crossroads and *
 
 On the client: live branch targets list under the main road, a small crossroad cue appears on those rounds, and **Journey** includes the side paths.
 
+### Topic Realms (1.1)
+
+| Option | Default | What it does |
+| --- | --- | --- |
+| `topic_portals` | `true` | Every branch becomes a **Realm** with its own topic (History, Music, Sports, ...). Each Realm opens with its own **Portal** item (`History Portal`, `Music Portal`, ...) instead of Branch Keys, so Realms open in whatever order their Portals arrive. |
+
+- In Grand Goal games a Realm needs its Portal **and** its crossroad round finished (either order). In Realm Master games the Portal alone opens it.
+- Every Realm gets a different enabled category with at least `branch_length` spare articles. Generation stops with a clear message if there are not enough, so lower `branch_count` / `branch_length` or enable more `include_*` categories.
+- Realm target rerolls stay on topic (off-topic only once the Realm's own slice runs dry).
+- `additional_branch_keys` is ignored while this is on.
+
+On the client each Realm has its own color on the round track, in the target list, in the **Realms** checklist and on the Journey map. The main road stays brass.
+
+---
+
+## Goal
+
+| Option | Default | What it does |
+| --- | --- | --- |
+| `goal` | `grand_goal` | `grand_goal`: collect `required_fragments`, then land on the answer to the Grand Goal question. `realm_master`: clear the last round of every branch / Realm. |
+
+`realm_master` needs `branch_count` of at least 1. It generates no Knowledge Fragments and no Grand Goal; the **Realms** checklist is your goal tracker. Realms open with their Portal (or, with plain branches, their Branch Keys) alone: no crossroad round to reach first. It works with or without `topic_portals`, but it is built for it.
+
 ### Letter-pair bingo
 
 When `toggle_bingo_letterpairs` is on (default), you get `bingo_cards_start` boards (default **1**) of size `bingo_letterpairs_grid` (3–20, default **5**). Set start to **0** to keep every board locked until **Progressive Bingo Card** items (`bingo_card_unlocks`, default **2**). Bingo on with start **0** and unlocks **0** is rejected (no boards). `bingo_stamp_unlocks` (default **2**) adds **Progressive Bingo Stamp** items that each fill one empty cell.
@@ -59,12 +82,10 @@ On the client: unlocked boards stamp in parallel from page titles; click a board
 
 ---
 
-## Grand Goal article
+## Grand Goal article (goal: grand_goal)
 
 | Option | Default | What it does |
 | --- | --- | --- |
-| `random_goal_article` | `true` | Kept for old YAMLs; ignored. The Grand Goal always comes from that wiki language's goal pool (answer page preferred from enabled categories). |
-| `goal_article_preset` | `dark_souls` | Deprecated and ignored. Kept so older YAMLs still generate. |
 
 ---
 
@@ -77,6 +98,8 @@ On the client: unlocked boards stamp in parallel from page titles; click a board
 | `scrollsanity` | `false` | If true, scrolling starts slow and improves with **Progressive Scroll Speed** items. |
 
 These add friction; leave them off for a first playtest or casual multiworld.
+
+Scrollsanity only slows the mouse wheel (laptop touchpads too, since browsers report them as a wheel) and the arrow, Page Up / Page Down and Space keys. It doesn't affect touch (finger) scrolling on phones and tablets.
 
 ---
 
@@ -132,6 +155,8 @@ Each `include_*` toggle shapes which articles can appear in rounds and (when ran
 | `include_animals` | `true` |
 | `include_biology_medicine` | `true` |
 | `include_miscellaneous` | `true` |
+
+`include_mythology_folklore` is the **Legends & Beliefs** category in the game (myths, folklore, legends, cryptids and religious figures; Portal: `Legends & Beliefs Portal`).
 
 `board_games` was removed in 0.6. Leave at least one category enabled.
 

@@ -1,11 +1,14 @@
-﻿
+
 import argparse
 import asyncio
+import functools
+import ipaddress
 import json
 import logging
 import math
 import os
 import random
+import socket
 import subprocess
 import time
 import urllib.parse
@@ -20,13 +23,42 @@ import websockets
 from aiohttp import web
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
-LOG = logging.getLogger("wikipelago-cloud")
+LOG = logging.getLogger("wikipelago-bridge")
 
 # Client/release label for the hosted UI (independent of apworld tag until a release cut).
-CLIENT_VERSION = "1.0.3"
+CLIENT_VERSION = "1.1.1b"
 TELEPORT_COOLDOWN_SEC = 60
+# Wiki Compass: backlink pages (500 titles each) fetched per target, once per session.
+COMPASS_BACKLINK_PAGES = 2
+# Wikimedia asks API clients for a descriptive User-Agent with a contact URL; vague ones get throttled first.
+WIKI_USER_AGENT = f"WikipelagoBridge/{CLIENT_VERSION} (https://github.com/Dreskn/Wikipelago-Continued)"
+# The 9 wikis the apworld supports. Anything else from slot_data or a request falls back to English,
+# so a room can't point the bridge's Wikipedia requests at another host.
+WIKI_LANGUAGES = frozenset({"en", "fr", "de", "es", "it", "pt", "nl", "sv", "pl"})
+WIKI_MAX_RESPONSE_BYTES = 4 * 1024 * 1024
+# Per-session Compass/title caches are small LRUs: targets stay hot, old pages fall out.
+LINK_CACHE_SIZE = 40
+BACKLINK_CACHE_SIZE = 20
+TITLE_CACHE_SIZE = 2000
+# Wikipedia titles are at most 255 bytes; anything much longer is not a page.
+MAX_TITLE_CHARS = 300
+MAX_REQUEST_BYTES = 256 * 1024
+MAX_SESSIONS = 1000
+MAX_SESSIONS_PER_CLIENT = 40
+# A full server or client may reclaim sessions idle this long (they still expire after SESSION_TTL_SECONDS).
+SESSION_RECLAIM_IDLE_SECONDS = 120
+PRIVATE_SERVER_ERROR = (
+    "This address is on a private network, which the hosted client can't reach. "
+    "For private or VPN rooms, run the client on your own computer (see the setup guide)."
+)
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
+
+# Host message shown on every open page: plain text in announcement.txt at the repo root (gitignored).
+# Write or delete the file on the server; no restart needed.
+ANNOUNCEMENT_FILE = _REPO_ROOT / "announcement.txt"
+ANNOUNCEMENT_MAX_CHARS = 500
+ANNOUNCEMENT_RECHECK_SECONDS = 3.0
 
 
 def _env_first(*names: str) -> str:
@@ -43,7 +75,7 @@ def debug_menu_enabled() -> bool:
 
 
 def _git_output(*args: str) -> str:
-    """Best-effort git identity for self-hosted/VPS deploys (Render sets env instead)."""
+    """Best-effort git identity for self-hosted deploys."""
     try:
         out = subprocess.check_output(
             ["git", *args],
@@ -57,25 +89,28 @@ def _git_output(*args: str) -> str:
         return ""
 
 
+@functools.lru_cache(maxsize=1)
+def _git_identity() -> tuple[str, str]:
+    """(branch, commit) of the checkout, read once: a deploy restarts the bridge, so they can't change while it runs."""
+    branch = _git_output("rev-parse", "--abbrev-ref", "HEAD")
+    if branch == "HEAD":
+        # Detached checkout — keep a usable label if possible.
+        branch = _git_output("name-rev", "--name-only", "--no-undefined", "HEAD") or "HEAD"
+    return branch, _git_output("rev-parse", "HEAD")
+
+
 def build_info() -> dict[str, Any]:
-    """Deploy identity for the UI.
+    """Deploy identity for the UI: WIKIPELAGO_* overrides, then `git` in the repo root."""
+    branch = _env_first("WIKIPELAGO_GIT_BRANCH")
+    commit_full = _env_first("WIKIPELAGO_GIT_COMMIT")
+    service = _env_first("WIKIPELAGO_SERVICE_NAME")
 
-    Prefer Render-injected RENDER_GIT_* / RENDER_SERVICE_NAME. On a VPS or local
-    checkout, fall back to WIKIPELAGO_* overrides, then `git` in the repo root.
-    """
-    branch = _env_first("RENDER_GIT_BRANCH", "WIKIPELAGO_GIT_BRANCH")
-    commit_full = _env_first("RENDER_GIT_COMMIT", "WIKIPELAGO_GIT_COMMIT")
-    service = _env_first("RENDER_SERVICE_NAME", "WIKIPELAGO_SERVICE_NAME")
-
-    if not branch:
-        branch = _git_output("rev-parse", "--abbrev-ref", "HEAD")
-        if branch == "HEAD":
-            # Detached checkout — keep a usable label if possible.
-            branch = _git_output("name-rev", "--name-only", "--no-undefined", "HEAD") or "HEAD"
+    if not branch or not commit_full:
+        git_branch, git_commit = _git_identity()
+        branch = branch or git_branch
+        commit_full = commit_full or git_commit
     if not branch:
         branch = "local"
-    if not commit_full:
-        commit_full = _git_output("rev-parse", "HEAD")
 
     commit = commit_full[:7] if commit_full else ""
     staging = branch not in ("main", "master")
@@ -115,11 +150,37 @@ DEFAULT_ITEMS = {
     "Wrong Wiki": 1_870_049,
 }
 
+# Topic Realms: must match world Items.PORTAL_ITEM_BY_TOPIC (same order, ids from +50).
+PORTAL_ITEM_BY_TOPIC: dict[str, str] = {
+    "video_games": "Video Games Portal",
+    "movies": "Film Portal",
+    "tv_shows": "Television Portal",
+    "anime_manga": "Anime & Manga Portal",
+    "sports": "Sports Portal",
+    "science_space": "Science & Space Portal",
+    "technology": "Technology Portal",
+    "history": "History Portal",
+    "geography": "Geography Portal",
+    "food_cuisine": "Food Portal",
+    "art_literature": "Arts & Literature Portal",
+    "mythology_folklore": "Legends & Beliefs Portal",
+    "music": "Music Portal",
+    "politics": "Politics Portal",
+    "famous_people": "People Portal",
+    "miscellaneous": "Curiosities Portal",
+    "animals": "Animals Portal",
+    "biology_medicine": "Biology & Medicine Portal",
+}
+for _portal_index, _portal_name in enumerate(PORTAL_ITEM_BY_TOPIC.values(), start=50):
+    DEFAULT_ITEMS[_portal_name] = 1_870_000 + _portal_index
+
 TRAP_ITEM_NAMES = frozenset({"Foggy Links", "Missing Links", "Wrong Wiki"})
 LINK_BOMB_DENSITY_COUNTS = {0: 1, 1: 5, 2: 20}
 # Fallback max for legacy seeds that omit target_rerolls_start.
 TARGET_REROLLS_PER_ROUND = 3
 MAX_TRAVEL_EVENTS = 5000
+# The stored journey may run this far past MAX_TRAVEL_EVENTS before it is rewritten trimmed.
+TRAVEL_TRIM_SLACK = 500
 PROGRESSIVE_STACK_ITEMS = frozenset({
     "Knowledge Fragment",
     "Round Access",
@@ -167,9 +228,132 @@ MAX_AP_CONNECT_ATTEMPTS = 3
 
 
 def normalize_title(title: str) -> str:
+    # Accents stay: in many wikis "Año" and "Ano", or "Bürger" and "Burger", are different articles.
     spaced = " ".join(title.replace("_", " ").strip().split())
-    deaccented = "".join(ch for ch in unicodedata.normalize("NFKD", spaced) if not unicodedata.combining(ch))
-    return deaccented.casefold()
+    return unicodedata.normalize("NFC", spaced).casefold()
+
+
+def wiki_language(value: Any) -> str:
+    """A supported Wikipedia language code, or "" when the value isn't one."""
+    code = str(value or "").strip().lower()
+    return code if code in WIKI_LANGUAGES else ""
+
+
+def cache_get(cache: dict[str, Any], key: str) -> Any:
+    """Read from a dict used as a small LRU cache; a hit moves the entry to the newest end."""
+    if key not in cache:
+        return None
+    value = cache.pop(key)
+    cache[key] = value
+    return value
+
+
+def cache_put(cache: dict[str, Any], key: str, value: Any, limit: int) -> None:
+    cache.pop(key, None)
+    cache[key] = value
+    while len(cache) > limit:
+        del cache[next(iter(cache))]
+
+
+def _is_public_ip(address: str) -> bool:
+    try:
+        ip = ipaddress.ip_address(str(address or "").split("%", 1)[0])
+    except ValueError:
+        return False
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped:
+        ip = ip.ipv4_mapped
+    return ip.is_global
+
+
+def client_address(request: web.Request) -> str:
+    """The browser's address. Behind Caddy the bridge only sees 127.0.0.1, so use the address the proxy appended."""
+    forwarded = request.headers.get("X-Forwarded-For", "")
+    if forwarded:
+        return forwarded.split(",")[-1].strip()
+    return request.remote or ""
+
+
+def is_local_request(request: web.Request) -> bool:
+    """True when the browser reaches this bridge directly from this machine or its own network, not through
+    a reverse proxy: only then may it connect to Archipelago servers on private addresses."""
+    if any(name in request.headers for name in ("X-Forwarded-For", "Forwarded", "X-Real-IP")):
+        return False
+    remote = request.remote or ""
+    try:
+        ipaddress.ip_address(remote.split("%", 1)[0])
+    except ValueError:
+        return False
+    return not _is_public_ip(remote)
+
+
+def split_server_address(server: str) -> tuple[str, int | None]:
+    """(host, port) from what players type: "archipelago.gg:38281", "wss://host:port/", "[::1]:38281"."""
+    cleaned = str(server or "").strip()
+    for prefix in ("wss://", "ws://", "https://", "http://"):
+        if cleaned.lower().startswith(prefix):
+            cleaned = cleaned[len(prefix):]
+            break
+    hostport = cleaned.strip("/").split("/", 1)[0]
+    port_text = ""
+    if hostport.startswith("["):
+        host, _, rest = hostport[1:].partition("]")
+        port_text = rest[1:] if rest.startswith(":") else ""
+    elif hostport.count(":") == 1:
+        host, port_text = hostport.split(":", 1)
+    else:
+        host = hostport
+    port: int | None = None
+    if port_text:
+        try:
+            port = int(port_text)
+        except ValueError:
+            port = None
+    return host.strip().lower(), port
+
+
+async def ap_server_address_error(server: str, allow_private: bool) -> str:
+    """Why this Archipelago address can't be used, or "". A public bridge must not let visitors reach
+    machines on the network behind it, so private, loopback and similar addresses are refused there."""
+    host, port = split_server_address(server)
+    if not host:
+        return "Unable to reach server. Check the address."
+    if allow_private:
+        return ""
+    try:
+        infos = await asyncio.get_running_loop().getaddrinfo(host, port or 38281, type=socket.SOCK_STREAM)
+    except (OSError, UnicodeError):
+        return "Unable to reach server. Check the address."
+    if not infos or any(not _is_public_ip(info[4][0]) for info in infos):
+        return PRIVATE_SERVER_ERROR
+    return ""
+
+
+async def read_json_body(request: web.Request) -> dict[str, Any]:
+    """The request's JSON object, or {} when the body is missing or malformed."""
+    try:
+        data = await request.json()
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def compass_hint(previous: tuple[int, int] | None, current: tuple[int, int]) -> str:
+    """Wiki Compass word for a (level, overlap) reading compared with the previous one for that target."""
+    level, overlap = current
+    if level == 0:
+        return "On target"
+    if previous is None:
+        return "Calibrating"
+    prev_level, prev_overlap = previous
+    if level != prev_level:
+        return "Warmer" if level < prev_level else "Colder"
+    # Same level: compare link overlap, ignoring small wobbles (about 12%).
+    margin = max(1, prev_overlap // 8)
+    if overlap >= prev_overlap + margin:
+        return "Warmer"
+    if overlap <= prev_overlap - margin:
+        return "Colder"
+    return "Same"
 
 
 # Must match world/APWorldSource/wikipelago/letter_pairs.py (Scrabble alphabets).
@@ -191,9 +375,15 @@ def _bingo_alphabet(lang: str) -> str:
     return _SCRABBLE_LETTERS.get(code, _SCRABBLE_LETTERS["en"])
 
 
+# Ligatures Unicode does not decompose; Scrabble plays them as two tiles (French Œuf = O-E).
+_BINGO_LIGATURES: dict[str, str] = {"œ": "OE", "Œ": "OE", "æ": "AE", "Æ": "AE"}
+
+
 def _fold_bingo_base_latin(ch: str) -> str:
     if ch in ("ß", "ẞ"):
         return "SS"
+    if ch in _BINGO_LIGATURES:
+        return _BINGO_LIGATURES[ch]
     decomposed = unicodedata.normalize("NFKD", ch)
     out: list[str] = []
     for part in decomposed:
@@ -255,6 +445,13 @@ PRACTICE_POOL_DIR = (
 )
 PRACTICE_SUPPORTED_LANGS = ("en", "fr", "de", "es", "it", "pt", "nl", "sv", "pl")
 _PRACTICE_POOL_CACHE: dict[str, list[str]] = {}
+# Practice extras: one 5x5 bingo board and one open Realm, each replaceable once finished. No checks.
+PRACTICE_BINGO_GRID = 5
+PRACTICE_REALM_LENGTH = 5
+PRACTICE_REALM_REROLL_MAX = 300
+_PRACTICE_TOPIC_CACHE: dict[str, dict[str, list[str]]] = {}
+_LETTER_PAIRS_MODULE: Any = None
+_ARTICLE_POOL_MODULE: Any = None
 
 
 def load_practice_titles(lang: str = "en", *, include_sensitive: bool = False) -> list[str]:
@@ -281,6 +478,8 @@ def load_practice_titles(lang: str = "en", *, include_sensitive: bool = False) -
             continue
         if not include_sensitive and bool(entry.get("sensitive")):
             continue
+        if not article_pool_module().is_usable_title(title, code):
+            continue
         titles.append(title)
     # Preserve order, drop dupes.
     titles = list(dict.fromkeys(titles))
@@ -290,6 +489,55 @@ def load_practice_titles(lang: str = "en", *, include_sensitive: bool = False) -
     return list(titles)
 
 
+def load_practice_topics(lang: str = "en") -> dict[str, list[str]]:
+    """Non-sensitive practice titles grouped by Realm topic tag (same pools and tags as the apworld)."""
+    code = (lang or "en").strip().lower()
+    cached = _PRACTICE_TOPIC_CACHE.get(code)
+    if cached is not None:
+        return {tag: list(titles) for tag, titles in cached.items()}
+    path = PRACTICE_POOL_DIR / f"pool_{code}.json"
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    by_tag: dict[str, list[str]] = {}
+    for entry in payload.get("entries") or []:
+        title = str(entry.get("title") or "").strip()
+        if not title or bool(entry.get("sensitive")) or not article_pool_module().is_usable_title(title, code):
+            continue
+        for tag in entry.get("tags") or []:
+            if tag in PORTAL_ITEM_BY_TOPIC:
+                by_tag.setdefault(str(tag), []).append(title)
+    by_tag = {tag: list(dict.fromkeys(titles)) for tag, titles in by_tag.items()}
+    _PRACTICE_TOPIC_CACHE[code] = by_tag
+    return {tag: list(titles) for tag, titles in by_tag.items()}
+
+
+def article_pool_module() -> Any:
+    """The apworld's article_pool.py, so Practice skips the same titles real seeds skip (list pages, banned words)."""
+    global _ARTICLE_POOL_MODULE
+    if _ARTICLE_POOL_MODULE is None:
+        import importlib.util
+
+        path = PRACTICE_POOL_DIR.parent / "article_pool.py"
+        spec = importlib.util.spec_from_file_location("wikipelago_article_pool", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        _ARTICLE_POOL_MODULE = module
+    return _ARTICLE_POOL_MODULE
+
+
+def letter_pairs_module() -> Any:
+    """The apworld's letter_pairs.py, for building practice boards with the same weights as real seeds."""
+    global _LETTER_PAIRS_MODULE
+    if _LETTER_PAIRS_MODULE is None:
+        import importlib.util
+
+        path = PRACTICE_POOL_DIR.parent / "letter_pairs.py"
+        spec = importlib.util.spec_from_file_location("wikipelago_letter_pairs", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        _LETTER_PAIRS_MODULE = module
+    return _LETTER_PAIRS_MODULE
+
+
 @dataclass
 class SessionState:
     connected_to_ap: bool = False
@@ -297,6 +545,8 @@ class SessionState:
     practice_pool_titles: list[str] = field(default_factory=list)
     ap_server: str = ""
     slot_name: str = ""
+    goal: str = "grand_goal"
+    topic_portals: bool = False
     check_count: int = 10
     required_fragments: int = 8
     start_rounds_unlocked: int = 5
@@ -321,15 +571,14 @@ class SessionState:
     trap_type: int = 0
     trap_link: bool = False
     bingo_letterpairs: bool = False
-    bingo_letterpairs_grid: int = 0
     bingo_letterpairs_boards: list[list[list[str]]] = field(default_factory=list)
     bingo_cards_start: int = 0
-    bingo_card_unlocks: int = 0
-    bingo_stamp_unlocks: int = 0
     bingo_letterpairs_location_ids: dict[str, dict[str, int]] = field(default_factory=dict)
     bingo_stamped_pairs: dict[str, set[str]] = field(default_factory=dict)
     bingo_stamps_used: int = 0
     bingo_storage_ready: bool = False
+    # Practice only: bingo lines already completed per board (no AP locations to tick).
+    practice_bingo_lines: dict[str, set[str]] = field(default_factory=dict)
     pending_events: list[dict[str, Any]] = field(default_factory=list)
     round_pairs: list[dict[str, str]] = field(default_factory=list)
     goal_article_title: str = ""
@@ -342,6 +591,14 @@ class SessionState:
     back_depth_start: int = 0
     backs_used: int = 0
     backs_round: str = ""
+    # Rerolled targets and this main round's Reroll/Back use, kept across reconnects and stored in AP
+    # DataStorage (wikipelago_progress_{team}_{slot}): {"main:3": {"target": ..., "n": 1},
+    # "branch:0:1": {"target": ..., "n": 2}, "uses": {"round": 3, "rerolls": 1, "backs": 2}}.
+    # n counts the rerolls of that round, so the most rerolled copy wins when devices race.
+    progress_entries: dict[str, dict[str, Any]] = field(default_factory=dict)
+    # Seed, team and slot the entries belong to.
+    progress_owner: str = ""
+    progress_storage_ready: bool = False
     location_round_ids: list[int] = field(default_factory=list)
     location_grand_goal: int | None = None
     location_branch_ids: list[list[int]] = field(default_factory=list)
@@ -353,16 +610,18 @@ class SessionState:
     clicks_storage_ready: bool = False
     last_page: str = ""
     last_teleport_at: float = 0.0
-    path_last_page: dict[str, str] = field(default_factory=dict)
-    active_path: str = "main"
     crossroads: list[dict[str, Any]] = field(default_factory=list)
+    # False for Realm Master seeds from 1.1.1 on: a Realm opens with its Portal (or keys) alone.
+    realms_need_crossroad: bool = True
     branches: list[dict[str, Any]] = field(default_factory=list)
     branch_round_index: dict[int, int] = field(default_factory=dict)
     travel_events: list[dict[str, Any]] = field(default_factory=list)
     visit_counts: dict[str, int] = field(default_factory=dict)
     travel_storage_ready: bool = False
     warmer_colder: str | None = None
-    last_distance_estimate: int | None = None
+    # Wiki Compass: last (level, overlap) reading per live target title, and which target the hint is about.
+    compass_memory: dict[str, tuple[int, int]] = field(default_factory=dict)
+    compass_target: dict[str, Any] | None = None
     boss_completed: bool = False
     goal_status_sent: bool = False
     last_error: str = ""
@@ -372,26 +631,6 @@ class SessionState:
     player_names: dict[int, str] = field(default_factory=dict)
     slot_games: dict[int, str] = field(default_factory=dict)
     item_id_to_name: dict[str, dict[int, str]] = field(default_factory=dict)
-
-    def active_branch_id(self) -> int | None:
-        if not str(self.active_path or "").startswith("branch:"):
-            return None
-        try:
-            return int(str(self.active_path).split(":", 1)[1])
-        except Exception:
-            return None
-
-    def current_branch(self) -> dict[str, Any] | None:
-        bid = self.active_branch_id()
-        if bid is None:
-            return None
-        for branch in self.branches:
-            try:
-                if int(branch.get("id", -1)) == bid:
-                    return branch
-            except Exception:
-                continue
-        return None
 
     def progress_key(self) -> str:
         return f"main:{self.round_index}"
@@ -408,10 +647,94 @@ class SessionState:
             return self.round_pairs[-1]["target"]
         return self.round_pairs[self.round_index]["start"]
 
+    def is_realm_master(self) -> bool:
+        return self.goal == "realm_master"
+
+    def reset_compass(self) -> None:
+        self.warmer_colder = None
+        self.compass_memory = {}
+        self.compass_target = None
+
+    def compass_targets(self) -> list[dict[str, Any]]:
+        """Live targets the Wiki Compass can point at: the main road plus every open branch / Realm."""
+        targets: list[dict[str, Any]] = []
+        main = self.current_target()
+        if self.boss_completed and self.round_index >= len(self.round_pairs):
+            main = ""  # goal done: only rounds whose checks are still open (no-release rooms)
+        if main:
+            targets.append({"kind": "main", "title": main})
+        for live in self.live_branch_targets():
+            if live.get("target"):
+                targets.append({
+                    "kind": "branch",
+                    "branch_id": live["id"],
+                    "fork": live["fork"],
+                    "theme_tag": live["theme_tag"],
+                    "title": live["target"],
+                })
+        return targets
+
     def goal_article(self) -> str:
+        if self.is_realm_master():
+            return ""
         if self.goal_article_title:
             return self.goal_article_title
         return self.round_pairs[-1]["target"] if self.round_pairs else ""
+
+    def realm_cleared(self, branch_id: int) -> bool:
+        if self.practice:
+            pairs = self.branch_pairs(branch_id)
+            return bool(pairs) and int(self.branch_round_index.get(int(branch_id), 0) or 0) >= len(pairs)
+        try:
+            loc_ids = self.location_branch_ids[int(branch_id)]
+        except Exception:
+            return False
+        return bool(loc_ids) and all(loc_id in self.checked_locations for loc_id in loc_ids)
+
+    def realms_cleared_count(self) -> int:
+        return sum(1 for bid in range(len(self.location_branch_ids)) if self.realm_cleared(bid))
+
+    def realm_master_met(self) -> bool:
+        if not self.is_realm_master() or not self.location_branch_ids:
+            return False
+        return self.realms_cleared_count() >= len(self.location_branch_ids)
+
+    def branch_portal_item(self, branch_id: int) -> str:
+        branch = self.branch_by_id(branch_id)
+        return str((branch or {}).get("portal_item") or "")
+
+    def realms_payload(self) -> list[dict[str, Any]]:
+        """One row per branch / Realm for the HUD (locked, open, cleared)."""
+        unlocked = set(self.unlocked_branch_ids())
+        crossroad_by_branch: dict[int, int] = {}
+        for cr in self.active_crossroads():
+            try:
+                crossroad_by_branch[int(cr.get("branch_id") or 0)] = int(cr.get("main_round") or 0)
+            except Exception:
+                continue
+        rows: list[dict[str, Any]] = []
+        for branch in self.branches:
+            try:
+                bid = int(branch.get("id") or 0)
+            except Exception:
+                continue
+            pairs = branch.get("pairs") or []
+            length = len(pairs) if isinstance(pairs, list) else 0
+            idx = int(self.branch_round_index.get(bid, 0) or 0)
+            portal = str(branch.get("portal_item") or "")
+            rows.append({
+                "id": bid,
+                "fork": bid + 1,
+                "theme_tag": str(branch.get("theme_tag") or ""),
+                "portal_item": portal,
+                "has_portal": bool(portal) and self.has_item(portal),
+                "crossroad_round": crossroad_by_branch.get(bid, 0),
+                "unlocked": bid in unlocked,
+                "completed": min(idx, length),
+                "length": length,
+                "cleared": self.realm_cleared(bid),
+            })
+        return rows
 
     def fragments(self) -> int:
         fragment_id = self.item_ids.get("Knowledge Fragment", DEFAULT_ITEMS["Knowledge Fragment"])
@@ -441,11 +764,6 @@ class SessionState:
             return 0
         return int(math.ceil(left))
 
-    def teleport_ready_at(self) -> float:
-        if self.last_teleport_at <= 0:
-            return 0.0
-        return self.last_teleport_at + TELEPORT_COOLDOWN_SEC
-
     def owned_search_letters(self) -> list[str]:
         letters = set(self.search_starting_letters)
         for letter in "ABCDEFGHIJKLMNOPQRSTUVWXYZ":
@@ -454,7 +772,7 @@ class SessionState:
         return sorted(letters)
 
     def boss_ready(self) -> bool:
-        if self.practice:
+        if self.practice or self.is_realm_master():
             return False
         return self.fragments() >= self.required_fragments
 
@@ -485,17 +803,28 @@ class SessionState:
     def back_depth_max(self) -> int:
         return max(0, self.back_depth_start) + self.item_count("Progressive Back")
 
+    def stored_round_uses(self, kind: str) -> int:
+        """Rerolls or Backs ("rerolls" / "backs") already spent this main round, from the slot's stored progress."""
+        uses = self.progress_entries.get("uses")
+        if self.practice or not uses or uses.get("round") != self.round_index:
+            return 0
+        return int(uses.get(kind) or 0)
+
+    def progress_ready(self) -> bool:
+        """Rerolls and Backs wait until the slot's stored progress has been read (Practice keeps none)."""
+        return self.practice or self.progress_storage_ready
+
     def sync_back_counter(self) -> None:
         key = self.progress_key()
         if self.backs_round != key:
             self.backs_round = key
-            self.backs_used = 0
+            self.backs_used = self.stored_round_uses("backs")
 
     def sync_target_reroll_counter(self) -> None:
         key = self.progress_key()
         if self.target_rerolls_round != key:
             self.target_rerolls_round = key
-            self.target_rerolls_used = 0
+            self.target_rerolls_used = self.stored_round_uses("rerolls")
 
     def backs_remaining(self) -> int:
         self.sync_back_counter()
@@ -503,7 +832,7 @@ class SessionState:
 
     def can_go_back(self) -> bool:
         self.sync_back_counter()
-        if not self.is_playable():
+        if not self.is_playable() or not self.progress_ready():
             return False
         return self.backs_remaining() > 0
 
@@ -516,7 +845,8 @@ class SessionState:
 
     def can_reroll_target(self) -> bool:
         self.sync_target_reroll_counter()
-        if not self.is_playable() or self.boss_completed:
+        # Still allowed after the goal: rooms that don't release on goal keep open rounds to play.
+        if not self.is_playable() or not self.progress_ready():
             return False
         if self.target_rerolls_remaining() <= 0:
             return False
@@ -542,10 +872,28 @@ class SessionState:
             })
         return slots
 
+    def target_in_use(self, title: str) -> bool:
+        """True when a main road or Realm round has this target."""
+        def _norm(value: Any) -> str:
+            return str(value or "").replace("_", " ").strip().casefold()
+
+        needle = _norm(title)
+        if not needle:
+            return False
+        if any(_norm(pair.get("target")) == needle for pair in self.round_pairs):
+            return True
+        return any(
+            isinstance(pair, dict) and _norm(pair.get("target")) == needle
+            for branch in self.branches
+            for pair in (branch.get("pairs") or [])
+        )
+
     def branch_key_count(self) -> int:
         return self.item_count("Branch Key")
 
     def branch_keys_available(self) -> int:
+        if self.topic_portals:
+            return 0
         return max(0, self.branch_key_count() - len(self.unlocked_branch_ids()))
 
     def reached_main_round(self) -> int:
@@ -553,7 +901,14 @@ class SessionState:
             return max(self.check_count, 1)
         return min(self.round_index + 1, max(self.check_count, 1))
 
+    def active_crossroads(self) -> list[dict[str, Any]]:
+        """Crossroads that gate a Realm in this seed (none when Realms open with their Portal / keys alone)."""
+        return self.crossroads if self.realms_need_crossroad else []
+
     def completed_crossroad_branch_ids(self) -> list[int]:
+        if not self.realms_need_crossroad:
+            # No crossroad to finish: every Realm is reachable, in id order (the keys' FIFO order).
+            return sorted(int(branch.get("id") or 0) for branch in self.branches)
         completed: list[tuple[int, int]] = []
         for cr in self.crossroads:
             try:
@@ -570,6 +925,15 @@ class SessionState:
         return [branch_id for _main, branch_id in completed]
 
     def unlocked_branch_ids(self) -> list[int]:
+        if self.practice:
+            # The practice Realm is open from the start: no crossroad, key or Portal.
+            return [int(branch.get("id") or 0) for branch in self.branches]
+        if self.topic_portals:
+            # Topic Realms: finished crossroad + that Realm's own Portal, in any order.
+            return [
+                bid for bid in self.completed_crossroad_branch_ids()
+                if self.branch_portal_item(bid) and self.has_item(self.branch_portal_item(bid))
+            ]
         keys = self.branch_key_count()
         if keys <= 0:
             return []
@@ -581,7 +945,7 @@ class SessionState:
 
     def revealed_crossroad(self) -> dict[str, Any] | None:
         current_round = self.reached_main_round()
-        for cr in self.crossroads:
+        for cr in self.active_crossroads():
             try:
                 main_round = int(cr.get("main_round") or 0)
                 branch_id = int(cr.get("branch_id") or 0)
@@ -591,11 +955,14 @@ class SessionState:
                 continue
             unlocked = self.is_branch_unlocked(branch_id)
             branch = self.branch_by_id(branch_id)
+            portal = str((branch or {}).get("portal_item") or "")
             return {
                 "main_round": main_round,
                 "branch_id": branch_id,
                 "fork": branch_id + 1,
                 "theme_tag": str((branch or {}).get("theme_tag") or ""),
+                "portal_item": portal,
+                "has_portal": bool(portal) and self.has_item(portal),
                 "unlocked": unlocked,
                 "needs_key": not unlocked,
             }
@@ -604,7 +971,7 @@ class SessionState:
     def crossroad_rounds(self) -> list[int]:
         current = self.reached_main_round()
         rounds: list[int] = []
-        for cr in self.crossroads:
+        for cr in self.active_crossroads():
             try:
                 main_round = int(cr.get("main_round") or 0)
             except Exception:
@@ -617,7 +984,7 @@ class SessionState:
         reached = set(self.crossroad_rounds())
         unlocked = set(self.unlocked_branch_ids())
         rounds: list[int] = []
-        for cr in self.crossroads:
+        for cr in self.active_crossroads():
             try:
                 main_round = int(cr.get("main_round") or 0)
                 branch_id = int(cr.get("branch_id") or 0)
@@ -671,6 +1038,7 @@ class SessionState:
                 "id": bid,
                 "fork": bid + 1,
                 "theme_tag": str(branch.get("theme_tag") or ""),
+                "portal_item": str(branch.get("portal_item") or ""),
                 "target": str(pairs[idx].get("target") or ""),
                 "round": min(idx + 1, max(len(pairs), 1)),
                 "length": len(pairs),
@@ -775,8 +1143,22 @@ class SessionState:
             completed.append("full")
         return completed
 
+    def bingo_line_keys(self, board_key: str) -> list[str]:
+        n = len(self.bingo_board_for_key(board_key))
+        if n <= 0:
+            return []
+        return [f"row_{i}" for i in range(1, n + 1)] + [f"col_{i}" for i in range(1, n + 1)] + ["diag", "anti", "full"]
+
+    def practice_board_full(self) -> bool:
+        return self.practice and self.bingo_letterpairs and "full" in self.bingo_completed_line_keys_for_board("1")
+
     def bingo_lines_checked(self) -> dict[str, dict[str, bool]]:
         result: dict[str, dict[str, bool]] = {}
+        if self.practice:
+            for board_key in self.unlocked_bingo_board_keys():
+                done = set(self.bingo_completed_line_keys_for_board(board_key))
+                result[board_key] = {key: key in done for key in self.bingo_line_keys(board_key)}
+            return result
         for board_key, id_map in self.bingo_letterpairs_location_ids.items():
             if not isinstance(id_map, dict):
                 continue
@@ -796,6 +1178,11 @@ class SessionState:
         return {
             "connected_to_ap": self.connected_to_ap,
             "practice": self.practice,
+            "goal": self.goal,
+            "topic_portals": self.topic_portals,
+            "realms": self.realms_payload(),
+            "practice_bingo_full": self.practice_board_full(),
+            "practice_realm_cleared": bool(self.practice and self.branches and self.realm_cleared(0)),
             "ap_server": self.ap_server,
             "slot_name": self.slot_name,
             "current_start": self.current_start(),
@@ -807,15 +1194,11 @@ class SessionState:
             "rounds_completed": min(self.round_index, self.check_count),
             "check_count": self.check_count,
             "target_rerolls_max": self.target_rerolls_max(),
-            "target_rerolls_used": self.target_rerolls_used,
             "target_rerolls_remaining": self.target_rerolls_remaining(),
             "can_reroll_target": self.can_reroll_target(),
             "clicks_used": self.clicks_used,
-            "clicks_storage_ready": self.clicks_storage_ready,
             "fragments": self.fragments(),
             "required_fragments": self.required_fragments,
-            "start_rounds_unlocked": self.start_rounds_unlocked,
-            "rounds_per_unlock": self.rounds_per_unlock,
             "round_access_count": self.round_access_count(),
             "unlocked_rounds": self.unlocked_rounds(),
             "searchsanity": self.searchsanity,
@@ -823,10 +1206,8 @@ class SessionState:
             "scroll_speed_upgrades": self.scroll_speed_upgrades,
             "scroll_speed_level": self.item_count("Progressive Scroll Speed"),
             "back_depth_max": self.back_depth_max(),
-            "backs_used": self.backs_used,
             "backs_remaining": self.backs_remaining(),
             "can_go_back": self.can_go_back(),
-            "back_button_unlocked": self.back_depth_max() > 0,
             "ctrl_f_unlocked": self.has_item("Ctrl+F Lens"),
             "search_letters": self.owned_search_letters(),
             "compass_unlocked": self.has_item("Wiki Compass"),
@@ -847,19 +1228,17 @@ class SessionState:
             "trap_type": self.trap_type,
             "trap_link": self.trap_link,
             "bingo_letterpairs": self.bingo_letterpairs,
-            "bingo_letterpairs_grid": self.bingo_letterpairs_grid,
             "bingo_letterpairs_boards": self.bingo_letterpairs_boards,
-            "bingo_cards_start": self.bingo_cards_start,
             "bingo_unlocked_boards": self.unlocked_bingo_boards(),
-            "bingo_stamp_unlocks": self.bingo_stamp_unlocks,
             "bingo_stamps_max": self.bingo_stamps_max(),
-            "bingo_stamps_used": max(0, self.bingo_stamps_used),
             "bingo_stamps_remaining": self.bingo_stamps_remaining(),
             "bingo_stamped_pairs": stamped_pairs,
             "bingo_stamped_cells": self.bingo_stamped_cells(),
             "bingo_lines_checked": self.bingo_lines_checked(),
             "bingo_storage_ready": self.bingo_storage_ready,
-            "pending_events": list(self.pending_events),
+            # Filled only by the endpoints that drain the queue (/status, /debug): every other
+            # response carries a status too, and listing events there delivered them twice.
+            "pending_events": [],
             "tables_unlocked": (not self.randomize_tables) or self.has_item("Table Lens"),
             "pictures_unlocked": (not self.randomize_pictures) or self.has_item("Picture Lens"),
             "incipit_unlocked": (not self.randomize_incipit) or self.has_item("Lead Lens"),
@@ -869,26 +1248,24 @@ class SessionState:
             "hatnotes_unlocked": (not self.randomize_hatnotes) or self.has_item("Hatnote Lens"),
             "references_unlocked": (not self.randomize_references) or self.has_item("Reference Lens"),
             "warmer_colder": self.warmer_colder,
+            "compass_target": self.compass_target,
             "boss_ready": self.boss_ready(),
             "boss_completed": self.boss_completed,
             "last_page": self.last_page,
             "teleport_cooldown_remaining": self.teleport_cooldown_remaining(),
-            "teleport_ready_at": self.teleport_ready_at(),
-            "can_teleport": self.is_playable() and self.teleport_cooldown_remaining() == 0,
             "last_error": self.last_error,
-            "active_path": "main",
             "paths": self.path_payload(),
-            "crossroads": list(self.crossroads),
+            "crossroads": list(self.active_crossroads()),
             "crossroad_rounds": self.crossroad_rounds(),
             "unlocked_crossroad_rounds": self.unlocked_crossroad_rounds(),
-            "branches": list(self.branches),
+            "branches": [
+                {key: value for key, value in branch.items() if key != "reroll_pool"}
+                for branch in self.branches
+            ],
             "unlocked_branch_ids": self.unlocked_branch_ids(),
             "live_branch_targets": self.live_branch_targets(),
-            "branch_key_count": self.branch_key_count(),
             "branch_keys_available": self.branch_keys_available(),
             "revealed_crossroad": self.revealed_crossroad(),
-            "travel_event_count": len(self.travel_events),
-            "travel_storage_ready": self.travel_storage_ready,
         }
 
 
@@ -902,10 +1279,19 @@ class APConnection:
         self.slot_name = ""
         self.password = ""
         self.items_seen = 0
+        self.allow_private = False
         self.link_cache: dict[str, set[str]] = {}
+        self.backlink_cache: dict[str, tuple[set[str], set[str]]] = {}
         self.resolved_title_cache: dict[str, str] = {}
+        # Length of the travel list in AP DataStorage, which only grows between full rewrites.
+        self._travel_stored_len = 0
+        self._clicks_persisted = -1
+        self._compass_seq = 0
+        self._compass_tasks: set[asyncio.Task] = set()
         self._scout_waiters: dict[int, asyncio.Future] = {}
         self._datapackage_requested = False
+        # From RoomInfo: tells a reconnect to the same game from a new seed on the same address.
+        self._room_seed = ""
 
     def _clear_practice_state(self) -> None:
         self.state.practice = False
@@ -946,28 +1332,91 @@ class APConnection:
         self.state.target_rerolls_used = 0
         self.state.target_rerolls_round = ""
         self.state.last_page = start
-        self.state.path_last_page["main"] = start
-        self.state.active_path = "main"
         self.state.crossroads = []
-        self.state.branches = []
-        self.state.branch_round_index = {}
+        self.state.goal = "grand_goal"
+        self.state.topic_portals = False
         if fresh_race:
+            # A chained practice round keeps its Realm; only a fresh race starts without one.
+            self.state.branches = []
+            self.state.branch_round_index = {}
             self.state.clicks_used = 0
-            self.state.path_last_page = {"main": start}
             self.state.travel_events = []
             self.state.visit_counts = {}
             self.state.travel_storage_ready = False
             self.state.clicks_storage_ready = False
-        self.state.warmer_colder = None
-        self.state.last_distance_estimate = None
+        self.state.reset_compass()
         self.state.boss_completed = False
         self.state.goal_status_sent = False
+
+    def _new_practice_board(self) -> None:
+        """A fresh 5x5 practice board, built like a real seed's (same per-language pair weights)."""
+        lang = (self.state.wikipedia_language or "en").strip().lower() or "en"
+        board = letter_pairs_module().build_letter_pair_bingo_board(random.Random(), PRACTICE_BINGO_GRID, lang)
+        self.state.bingo_letterpairs = True
+        self.state.bingo_letterpairs_boards = [board]
+        self.state.bingo_cards_start = 1
+        self.state.bingo_stamped_pairs.clear()
+        self.state.practice_bingo_lines = {}
+
+    def _new_practice_realm(self, *, avoid_topic: str = "") -> None:
+        """One open practice Realm: PRACTICE_REALM_LENGTH targets from a single topic."""
+        lang = (self.state.wikipedia_language or "en").strip().lower() or "en"
+        by_tag = load_practice_topics(lang)
+
+        def _norm(title: str) -> str:
+            return str(title or "").replace("_", " ").strip().casefold()
+
+        here = self.state.last_page or self.state.current_start()
+        busy = {_norm(here), _norm(self.state.current_target())}
+        options = {
+            tag: [title for title in titles if _norm(title) not in busy]
+            for tag, titles in by_tag.items()
+            if tag != avoid_topic
+        }
+        viable = sorted(tag for tag, titles in options.items() if len(titles) >= PRACTICE_REALM_LENGTH)
+        if not viable:
+            self.state.branches = []
+            self.state.branch_round_index = {}
+            return
+        tag = random.choice(viable)
+        titles = options[tag]
+        random.shuffle(titles)
+        targets = titles[:PRACTICE_REALM_LENGTH]
+        starts = [here] + targets[:-1]
+        self.state.branches = [{
+            "id": 0,
+            "theme_tag": tag,
+            "pairs": [{"start": start, "target": target} for start, target in zip(starts, targets)],
+            # Realm rerolls stay on topic.
+            "reroll_pool": titles[PRACTICE_REALM_LENGTH:PRACTICE_REALM_LENGTH + PRACTICE_REALM_REROLL_MAX],
+        }]
+        self.state.branch_round_index = {0: 0}
+
+    async def new_practice_board(self) -> dict[str, Any]:
+        if not self.state.practice:
+            return {"ok": False, "error": "practice only", "status": self.state.to_status()}
+        if not self.state.practice_board_full():
+            return {"ok": False, "error": "board not full yet", "status": self.state.to_status()}
+        self._new_practice_board()
+        return {"ok": True, "status": self.state.to_status()}
+
+    async def new_practice_realm(self) -> dict[str, Any]:
+        if not self.state.practice:
+            return {"ok": False, "error": "practice only", "status": self.state.to_status()}
+        if not (self.state.branches and self.state.realm_cleared(0)):
+            return {"ok": False, "error": "realm not cleared yet", "status": self.state.to_status()}
+        previous = str((self.state.branch_by_id(0) or {}).get("theme_tag") or "")
+        self._new_practice_realm(avoid_topic=previous)
+        self._schedule_compass(self.state.last_page)
+        return {"ok": True, "status": self.state.to_status()}
 
     async def start_practice(self, wikipedia_language: str = "en") -> dict[str, Any]:
         """Begin unlimited local Practice (no Archipelago). Exits any AP connection."""
         # Drop AP without treating this as "exit practice" (we are entering it).
+        lang = wiki_language(wikipedia_language or "en")
+        if not lang:
+            raise ValueError("Unsupported Wikipedia language.")
         await self.disconnect(leave_practice=False)
-        lang = (wikipedia_language or "en").strip().lower() or "en"
         titles = load_practice_titles(lang, include_sensitive=False)
 
         self.state.practice = True
@@ -998,11 +1447,8 @@ class APConnection:
         self.state.trap_count = 0
         self.state.trap_link = False
         self.state.bingo_letterpairs = False
-        self.state.bingo_letterpairs_grid = 0
         self.state.bingo_letterpairs_boards = []
         self.state.bingo_cards_start = 0
-        self.state.bingo_card_unlocks = 0
-        self.state.bingo_stamp_unlocks = 0
         self.state.bingo_letterpairs_location_ids = {}
         self.state.bingo_stamped_pairs.clear()
         self.state.bingo_stamps_used = 0
@@ -1018,6 +1464,8 @@ class APConnection:
             DEFAULT_ITEMS["Ctrl+F Lens"],
         ]
         self._roll_practice_race()
+        self._new_practice_board()
+        self._new_practice_realm()
         LOG.info(
             "Practice started lang=%s pool=%s start=%s target=%s",
             lang,
@@ -1027,7 +1475,7 @@ class APConnection:
         )
         return {"ok": True, "status": self.state.to_status()}
 
-    async def connect(self, server: str, slot_name: str, password: str = "") -> None:
+    async def connect(self, server: str, slot_name: str, password: str = "", *, allow_private: bool = False) -> None:
         prev_server = (self.server or "").strip().lower()
         prev_slot = (self.slot_name or "").strip().lower()
         next_server = (server or "").strip().lower()
@@ -1040,6 +1488,7 @@ class APConnection:
         self.server = server
         self.slot_name = slot_name
         self.password = password
+        self.allow_private = allow_private
 
         self.state.ap_server = server
         self.state.slot_name = slot_name
@@ -1050,33 +1499,28 @@ class APConnection:
         self.state.received_items.clear()
         self.state.boss_completed = False
         self.state.goal_status_sent = False
-        self.state.warmer_colder = None
-        self.state.last_distance_estimate = None
+        self.state.reset_compass()
         self.state.pending_events.clear()
         self.state.bingo_letterpairs = False
-        self.state.bingo_letterpairs_grid = 0
         self.state.bingo_letterpairs_boards = []
         self.state.bingo_cards_start = 0
-        self.state.bingo_card_unlocks = 0
-        self.state.bingo_stamp_unlocks = 0
         self.state.bingo_letterpairs_location_ids = {}
         self.state.bingo_stamped_pairs.clear()
         self.state.bingo_stamps_used = 0
         self.state.bingo_storage_ready = False
         self.state.clicks_storage_ready = False
         self.state.travel_storage_ready = False
+        self.state.progress_storage_ready = False
         self.state.target_rerolls_start = TARGET_REROLLS_PER_ROUND
         self.state.target_rerolls_used = 0
         self.state.target_rerolls_round = ""
         self.state.back_depth_start = 0
         self.state.backs_used = 0
         self.state.backs_round = ""
-        self.state.active_path = "main"
         self.state.crossroads = []
         self.state.branches = []
         self.state.branch_round_index = {}
         self.state.location_branch_ids = []
-        self.state.path_last_page = {}
         self.state.slot = 0
         self.state.team = 0
         self.state.player_names.clear()
@@ -1093,11 +1537,14 @@ class APConnection:
             self.state.goal_article_title = ""
             self.state.goal_question = ""
             self.state.reroll_pool = []
-            self.state.path_last_page = {}
         self.items_seen = 0
         self.link_cache.clear()
+        self.backlink_cache.clear()
         self.resolved_title_cache.clear()
+        self._travel_stored_len = 0
+        self._clicks_persisted = -1
         self._datapackage_requested = False
+        self._room_seed = ""
         for fut in self._scout_waiters.values():
             if not fut.done():
                 fut.cancel()
@@ -1129,14 +1576,17 @@ class APConnection:
             self.state.target_rerolls_start = TARGET_REROLLS_PER_ROUND
             self.state.clicks_used = 0
             self.state.last_page = ""
-            self.state.path_last_page = {}
             self.state.travel_events = []
             self.state.visit_counts = {}
-            self.state.active_path = "main"
             self.state.crossroads = []
             self.state.branches = []
-            self.state.warmer_colder = None
-            self.state.last_distance_estimate = None
+            self.state.branch_round_index = {}
+            # Practice bingo board goes with practice.
+            self.state.bingo_letterpairs = False
+            self.state.bingo_letterpairs_boards = []
+            self.state.bingo_stamped_pairs.clear()
+            self.state.practice_bingo_lines = {}
+            self.state.reset_compass()
         if self.reader_task and not self.reader_task.done():
             self.reader_task.cancel()
             try:
@@ -1150,6 +1600,12 @@ class APConnection:
         fail_streak = 0
         while True:
             try:
+                # Checked on every attempt: the name could resolve differently on a retry.
+                address_error = await ap_server_address_error(self.server, self.allow_private)
+                if address_error:
+                    self.state.connected_to_ap = False
+                    self.state.last_error = address_error
+                    return
                 ws_url = self._to_ws_url(self.server)
                 async with websockets.connect(ws_url, ping_interval=20, ping_timeout=20, max_size=2**24) as ws:
                     self.ws = ws
@@ -1200,7 +1656,8 @@ class APConnection:
             return "Unable to reach server. Check the address."
         if "timed out" in lowered or "timeout" in lowered:
             return "Connection timed out."
-        return message
+        # Raw socket errors would tell visitors which ports answer on the target; keep it generic.
+        return "Unable to connect to the server. Check the address and that the room is running."
 
     async def _handshake(self, ws: Any) -> None:
         room_info_raw = await asyncio.wait_for(ws.recv(), timeout=30)
@@ -1238,7 +1695,9 @@ class APConnection:
 
         for packet in packets:
             cmd = packet.get("cmd")
-            if cmd == "Connected":
+            if cmd == "RoomInfo":
+                self._room_seed = str(packet.get("seed_name") or "")
+            elif cmd == "Connected":
                 self.state.connected_to_ap = True
                 self.state.last_error = ""
                 self._apply_connected(packet)
@@ -1248,6 +1707,7 @@ class APConnection:
                 await self._request_bingo_stamps_from_storage()
                 await self._request_clicks_from_storage()
                 await self._request_travel_from_storage()
+                await self._request_progress_from_storage()
             elif cmd == "ConnectionRefused":
                 self.state.last_error = f"ConnectionRefused: {packet.get('errors', [])}"
                 raise RuntimeError(self.state.last_error)
@@ -1332,7 +1792,8 @@ class APConnection:
         self.state.crossroads = []
         self.state.branches = []
         self.state.branch_round_index = {}
-        self.state.active_path = "main"
+        # 1.1.0 seeds have no flag and always gated Realms behind their crossroad.
+        self.state.realms_need_crossroad = bool(slot_data.get("realms_need_crossroad", True))
         crossroads_raw = slot_data.get("crossroads")
         if isinstance(crossroads_raw, list):
             parsed_cross: list[dict[str, Any]] = []
@@ -1367,11 +1828,22 @@ class APConnection:
                         target = self._canonicalize_known_title(str(pair.get("target", "")).strip())
                         if start and target:
                             pairs.append({"start": start, "target": target})
-                parsed_branches.append({
+                parsed_branch: dict[str, Any] = {
                     "id": bid,
                     "theme_tag": str(item.get("theme_tag") or ""),
                     "pairs": pairs,
-                })
+                }
+                portal = str(item.get("portal_item") or "").strip()
+                if portal:
+                    parsed_branch["portal_item"] = portal
+                realm_pool = item.get("reroll_pool")
+                if isinstance(realm_pool, list):
+                    parsed_branch["reroll_pool"] = [
+                        self._canonicalize_known_title(str(title).strip())
+                        for title in realm_pool
+                        if str(title).strip()
+                    ]
+                parsed_branches.append(parsed_branch)
                 self.state.branch_round_index[bid] = 0
             self.state.branches = parsed_branches
 
@@ -1388,11 +1860,10 @@ class APConnection:
         else:
             self.state.goal_question = ""
 
-        wiki_lang = slot_data.get("wikipedia_language", "en")
-        if isinstance(wiki_lang, str) and wiki_lang.strip():
-            self.state.wikipedia_language = wiki_lang.strip().lower()
-        else:
-            self.state.wikipedia_language = "en"
+        wiki_lang = wiki_language(slot_data.get("wikipedia_language", "en"))
+        if not wiki_lang:
+            LOG.info("Unsupported wikipedia_language in slot_data: %r; using en", slot_data.get("wikipedia_language"))
+        self.state.wikipedia_language = wiki_lang or "en"
 
         reroll_pool = slot_data.get("reroll_pool")
         if isinstance(reroll_pool, list):
@@ -1402,6 +1873,9 @@ class APConnection:
                 if str(title).strip()
             ]
 
+        goal_raw = str(slot_data.get("goal") or "grand_goal").strip().lower()
+        self.state.goal = goal_raw if goal_raw in ("grand_goal", "realm_master") else "grand_goal"
+        self.state.topic_portals = bool(slot_data.get("topic_portals", False))
         self.state.check_count = int(slot_data.get("check_count", len(self.state.round_pairs)))
         self.state.required_fragments = int(slot_data.get("required_fragments", self.state.required_fragments))
         self.state.start_rounds_unlocked = int(slot_data.get("start_rounds_unlocked", self.state.start_rounds_unlocked))
@@ -1429,20 +1903,19 @@ class APConnection:
         self.state.trap_link = bool(slot_data.get("trap_link", False))
 
         self.state.bingo_letterpairs = bool(slot_data.get("bingo_letterpairs", False))
-        self.state.bingo_letterpairs_grid = int(slot_data.get("bingo_letterpairs_grid", 0) or 0)
         self.state.bingo_cards_start = int(slot_data.get("bingo_cards_start", 0) or 0)
-        self.state.bingo_card_unlocks = int(slot_data.get("bingo_card_unlocks", 0) or 0)
-        self.state.bingo_stamp_unlocks = int(slot_data.get("bingo_stamp_unlocks", 0) or 0)
         self.state.bingo_stamps_used = 0
         self.state.back_depth_start = int(slot_data.get("back_depth_start", 0) or 0)
         if "target_rerolls_start" in slot_data:
             self.state.target_rerolls_start = max(0, int(slot_data.get("target_rerolls_start") or 0))
         else:
             self.state.target_rerolls_start = TARGET_REROLLS_PER_ROUND
+        # Counters come back from the stored progress when they next sync; Rerolls and Backs wait for its Get reply.
         self.state.backs_used = 0
         self.state.backs_round = ""
         self.state.target_rerolls_used = 0
         self.state.target_rerolls_round = ""
+        self.state.progress_storage_ready = False
 
         boards: list[list[list[str]]] = []
         boards_raw = slot_data.get("bingo_letterpairs_boards")
@@ -1471,8 +1944,6 @@ class APConnection:
                     if self.state.bingo_cards_start <= 0:
                         self.state.bingo_cards_start = 1
         self.state.bingo_letterpairs_boards = boards if self.state.bingo_letterpairs else []
-        if self.state.bingo_letterpairs and self.state.bingo_letterpairs_grid <= 0 and boards:
-            self.state.bingo_letterpairs_grid = len(boards[0])
 
         location_ids = slot_data.get("location_ids", {})
         self.state.location_round_ids = [int(v) for v in location_ids.get("rounds", [])]
@@ -1542,6 +2013,16 @@ class APConnection:
             **local_names,
         }
 
+        # Same seed and slot as before a dropped connection: put the rerolled targets back on the rounds just
+        # reloaded from slot_data. The stored copy is merged in when its Get reply arrives.
+        owner = f"{self._room_seed}:{self.state.team}:{self.state.slot}"
+        if owner != self.state.progress_owner:
+            self.state.progress_owner = owner
+            self.state.progress_entries = {}
+        for key, entry in list(self.state.progress_entries.items()):
+            if entry.get("target"):
+                self._apply_stored_target(key, entry["target"])
+
         checked_locations = packet.get("checked_locations", [])
         if isinstance(checked_locations, list):
             restored_checked: set[int] = set()
@@ -1582,6 +2063,11 @@ class APConnection:
             self.state.branch_round_index[bid] = restored_branch_index
 
         if self.state.location_grand_goal and self.state.location_grand_goal in checked:
+            self.state.boss_completed = True
+            if assume_goal_already_sent:
+                self.state.goal_status_sent = True
+        if self.state.realm_master_met():
+            # Realm Master: no goal location; completion is "every Realm's last round checked".
             self.state.boss_completed = True
             if assume_goal_already_sent:
                 self.state.goal_status_sent = True
@@ -1932,6 +2418,8 @@ class APConnection:
         """Stamp letter-pair cells for this page; send newly completed bingo line checks."""
         if not self.state.bingo_letterpairs or not self.state.bingo_letterpairs_boards:
             return []
+        if self.state.practice:
+            return await self._apply_practice_bingo_visit(page_title)
         if not self.state.connected_to_ap or self.ws is None:
             return []
 
@@ -1946,6 +2434,28 @@ class APConnection:
             await self._persist_bingo_stamps()
             extra = {"pair": pair} if pair else None
             await self._append_travel_event("bingo_cell", page_title, extra=extra)
+        return events
+
+    async def _apply_practice_bingo_visit(self, page_title: str) -> list[dict[str, Any]]:
+        """Practice: stamp the page's pair and report newly finished lines. Nothing is sent to AP."""
+        wiki_lang = (self.state.wikipedia_language or "en").strip().lower() or "en"
+        pair = letter_pair_from_title(page_title, wiki_lang)
+        if not pair or not self._stamp_pair_on_unlocked_boards(pair):
+            return []
+        events: list[dict[str, Any]] = []
+        for board_key in self.state.unlocked_bingo_board_keys():
+            done = self.state.practice_bingo_lines.setdefault(board_key, set())
+            for key in self.state.bingo_completed_line_keys_for_board(board_key):
+                if key in done:
+                    continue
+                done.add(key)
+                events.append({
+                    "board": board_key,
+                    "key": key,
+                    "label": self._bingo_line_label(key, board_key),
+                    "sent_text": "",
+                })
+        await self._append_travel_event("bingo_cell", page_title, extra={"pair": pair})
         return events
 
     async def merge_bingo_stamps(self, stamped_pairs: Any) -> list[dict[str, Any]]:
@@ -1987,7 +2497,17 @@ class APConnection:
         return f"wikipelago_clicks_{self.state.team}_{self.state.slot}"
 
     def _travel_storage_key(self) -> str:
+        # 1.0 saves: one dict replaced on every click. Still read so older journeys carry over.
         return f"wikipelago_travel_{self.state.team}_{self.state.slot}"
+
+    def _travel_events_key(self) -> str:
+        return f"wikipelago_travel_events_{self.state.team}_{self.state.slot}"
+
+    def _travel_visits_key(self) -> str:
+        return f"wikipelago_travel_visits_{self.state.team}_{self.state.slot}"
+
+    def _progress_storage_key(self) -> str:
+        return f"wikipelago_progress_{self.state.team}_{self.state.slot}"
 
     def _resolve_retrieved(self, packet: dict[str, Any]) -> None:
         keys = packet.get("keys")
@@ -1995,13 +2515,16 @@ class APConnection:
             return
         bingo_key = self._bingo_storage_key()
         clicks_key = self._clicks_storage_key()
-        travel_key = self._travel_storage_key()
+        progress_key = self._progress_storage_key()
+        travel_keys = (self._travel_storage_key(), self._travel_events_key(), self._travel_visits_key())
+        if progress_key in keys:
+            asyncio.create_task(self._apply_progress_storage_payload(keys.get(progress_key), self.state.progress_owner))
         if bingo_key in keys:
             asyncio.create_task(self._apply_bingo_storage_payload(keys.get(bingo_key), source="Retrieved"))
         if clicks_key in keys:
             asyncio.create_task(self._apply_clicks_storage_payload(keys.get(clicks_key), source="Retrieved"))
-        if travel_key in keys:
-            asyncio.create_task(self._apply_travel_storage_payload(keys.get(travel_key), source="Retrieved"))
+        if any(key in keys for key in travel_keys):
+            asyncio.create_task(self._apply_travel_retrieved(*(keys.get(key) for key in travel_keys)))
 
     def _resolve_set_reply(self, packet: dict[str, Any]) -> None:
         key = packet.get("key")
@@ -2010,8 +2533,8 @@ class APConnection:
             asyncio.create_task(self._apply_bingo_storage_payload(raw, source="SetReply"))
         elif key == self._clicks_storage_key():
             asyncio.create_task(self._apply_clicks_storage_payload(raw, source="SetReply"))
-        elif key == self._travel_storage_key():
-            asyncio.create_task(self._apply_travel_storage_payload(raw, source="SetReply"))
+        elif key == self._progress_storage_key():
+            asyncio.create_task(self._apply_progress_storage_payload(raw, self.state.progress_owner))
 
     async def _request_bingo_stamps_from_storage(self) -> None:
         """Subscribe + Get stamped pairs from Archipelago DataStorage."""
@@ -2104,7 +2627,6 @@ class APConnection:
         if not title:
             return
         self.state.last_page = title
-        self.state.path_last_page[self.state.active_path or "main"] = title
 
     def _travel_event_key(self, event: dict[str, Any]) -> tuple[Any, ...]:
         return (
@@ -2195,6 +2717,9 @@ class APConnection:
             return
         key = self._clicks_storage_key()
         value = {"clicks_used": max(0, int(self.state.clicks_used or 0))}
+        if not force and value["clicks_used"] == self._clicks_persisted:
+            return
+        self._clicks_persisted = value["clicks_used"]
         payload = [{
             "cmd": "Set",
             "key": key,
@@ -2215,7 +2740,213 @@ class APConnection:
         if self.ws is None or not self.state.connected_to_ap or self.state.practice:
             return
         self.state.travel_storage_ready = False
-        key = self._travel_storage_key()
+        # Get only: a SetNotify subscription would send the whole journey back after every click.
+        payload = [{
+            "cmd": "Get",
+            "keys": [self._travel_storage_key(), self._travel_events_key(), self._travel_visits_key()],
+        }]
+        try:
+            async with self.send_lock:
+                await self.ws.send(json.dumps(payload))
+        except Exception as exc:
+            LOG.info("Travel DataStorage Get request failed: %s", exc)
+
+    async def _apply_travel_retrieved(self, legacy: Any, events_raw: Any, visits_raw: Any) -> None:
+        if self.state.practice:
+            self.state.travel_storage_ready = True
+            return
+        legacy_events, legacy_visits = self._parse_travel_storage_payload(legacy)
+        stored_events, stored_visits = self._parse_travel_storage_payload(
+            {"events": events_raw, "visit_counts": visits_raw}
+        )
+        self._merge_travel_state(legacy_events, legacy_visits)
+        self._merge_travel_state(stored_events, stored_visits)
+        self.state.travel_storage_ready = True
+        self._travel_stored_len = len(stored_events)
+        stored_keys = {self._travel_event_key(item) for item in stored_events}
+        merged_keys = {self._travel_event_key(item) for item in self.state.travel_events if isinstance(item, dict)}
+        visits_behind = any(
+            int(count or 0) > int(stored_visits.get(title, 0) or 0)
+            for title, count in self.state.visit_counts.items()
+        )
+        if merged_keys != stored_keys or len(stored_events) != len(merged_keys) or visits_behind:
+            # A 1.0 save seen for the first time, or steps taken while the room was unreachable.
+            await self._persist_travel()
+
+    async def _persist_travel(self) -> None:
+        """Rewrite the whole journey. Clicks only send their new step (_send_travel_step)."""
+        if self.state.practice or self.ws is None or not self.state.connected_to_ap:
+            return
+        if not self.state.travel_storage_ready:
+            return
+        payload = [
+            {
+                "cmd": "Set",
+                "key": self._travel_events_key(),
+                "default": [],
+                "operations": [{"operation": "replace", "value": list(self.state.travel_events)}],
+            },
+            {
+                "cmd": "Set",
+                "key": self._travel_visits_key(),
+                "default": {},
+                "operations": [{"operation": "replace", "value": dict(self.state.visit_counts)}],
+            },
+        ]
+        try:
+            async with self.send_lock:
+                await self.ws.send(json.dumps(payload))
+            self._travel_stored_len = len(self.state.travel_events)
+        except Exception as exc:
+            LOG.info("Travel DataStorage Set failed: %s", exc)
+
+    async def _send_travel_step(self, event: dict[str, Any], visited: str) -> None:
+        """Append one step to the stored journey instead of resending all of it."""
+        if self.state.practice or self.ws is None or not self.state.connected_to_ap:
+            return
+        if not self.state.travel_storage_ready:
+            # The Get reply merges this step in and rewrites the journey.
+            return
+        if self._travel_stored_len >= MAX_TRAVEL_EVENTS + TRAVEL_TRIM_SLACK:
+            # "add" only grows the stored list; now and then rewrite it trimmed to the local window.
+            await self._persist_travel()
+            return
+        payload = [{
+            "cmd": "Set",
+            "key": self._travel_events_key(),
+            "default": [],
+            "operations": [{"operation": "add", "value": [event]}],
+        }]
+        if visited:
+            payload.append({
+                "cmd": "Set",
+                "key": self._travel_visits_key(),
+                "default": {},
+                "operations": [{"operation": "update", "value": {visited: self.state.visit_counts.get(visited, 0)}}],
+            })
+        try:
+            async with self.send_lock:
+                await self.ws.send(json.dumps(payload))
+            self._travel_stored_len += 1
+        except Exception as exc:
+            LOG.info("Travel DataStorage step failed: %s", exc)
+
+    def _progress_round_pairs(self, key: str) -> tuple[list[dict[str, Any]], int, dict[str, Any] | None] | None:
+        """(pairs, index, Realm or None) of the round a stored progress key names: "main:3" or "branch:0:1"."""
+        parts = key.split(":")
+        try:
+            numbers = [int(part) for part in parts[1:]]
+        except ValueError:
+            return None
+        branch: dict[str, Any] | None = None
+        if parts[0] == "main" and len(numbers) == 1 and key == f"main:{numbers[0]}":
+            pairs: Any = self.state.round_pairs
+        elif parts[0] == "branch" and len(numbers) == 2 and key == f"branch:{numbers[0]}:{numbers[1]}":
+            branch = self.state.branch_by_id(numbers[0])
+            pairs = (branch or {}).get("pairs")
+        else:
+            return None
+        idx = numbers[-1]
+        if not isinstance(pairs, list) or not 0 <= idx < len(pairs):
+            return None
+        return pairs, idx, branch
+
+    def _parse_progress_payload(self, raw: Any) -> dict[str, dict[str, Any]]:
+        """The usable entries of a stored progress value; anything that doesn't fit this seed is dropped."""
+        entries: dict[str, dict[str, Any]] = {}
+        if not isinstance(raw, dict):
+            return entries
+        for key, value in raw.items():
+            key = str(key)
+            if not isinstance(value, dict):
+                continue
+            if key == "uses":
+                try:
+                    uses = {
+                        "round": int(value.get("round")),
+                        "rerolls": max(0, int(value.get("rerolls") or 0)),
+                        "backs": max(0, int(value.get("backs") or 0)),
+                    }
+                except (TypeError, ValueError):
+                    continue
+                if 0 <= uses["round"] <= self.state.check_count:
+                    entries[key] = uses
+                continue
+            target = value.get("target")
+            if not isinstance(target, str) or self._progress_round_pairs(key) is None:
+                continue
+            target = target.strip()
+            try:
+                times = max(1, int(value.get("n") or 1))
+            except (TypeError, ValueError):
+                times = 1
+            if target and len(target) <= MAX_TITLE_CHARS:
+                entries[key] = {"target": target, "n": times}
+        return entries
+
+    @staticmethod
+    def _merge_progress_entry(key: str, mine: dict[str, Any] | None, theirs: dict[str, Any] | None) -> dict[str, Any]:
+        """Join two copies of one entry the same way on every device, whatever order writes arrive in:
+        the most rerolled target wins (ties by title), and use counts keep the newest round's highest."""
+        if not mine or not theirs:
+            return dict(mine or theirs or {})
+        if key != "uses":
+            return dict(max(mine, theirs, key=lambda entry: (entry["n"], entry["target"])))
+        if mine["round"] != theirs["round"]:
+            return dict(max(mine, theirs, key=lambda uses: uses["round"]))
+        return {
+            "round": mine["round"],
+            "rerolls": max(mine["rerolls"], theirs["rerolls"]),
+            "backs": max(mine["backs"], theirs["backs"]),
+        }
+
+    def _apply_stored_target(self, key: str, title: str) -> bool:
+        """Put a rerolled target from the stored progress on its round and update the reroll pools the way the
+        reroll did: the new title leaves the pool, the one it replaces goes back (a Realm's into its own pool too)."""
+        found = self._progress_round_pairs(key)
+        if found is None:
+            return False
+        pairs, idx, branch = found
+        state = self.state
+        norm = self._norm_title
+        old_target = str(pairs[idx].get("target") or "")
+        if norm(old_target) == norm(title):
+            return False
+        pairs[idx]["target"] = title
+        state.reroll_pool = [item for item in state.reroll_pool if norm(item) != norm(title)]
+        if old_target and norm(old_target) != norm(state.goal_article()):
+            realm_pool = (branch or {}).get("reroll_pool")
+            if isinstance(realm_pool, list) and all(norm(item) != norm(old_target) for item in realm_pool):
+                realm_pool.append(old_target)
+            if not state.target_in_use(old_target) and all(norm(item) != norm(old_target) for item in state.reroll_pool):
+                state.reroll_pool.append(old_target)
+        return True
+
+    def _remember_rerolled_target(self, key: str, title: str) -> None:
+        if self.state.practice:
+            return
+        entry = self.state.progress_entries.get(key) or {}
+        self.state.progress_entries[key] = {"target": title, "n": int(entry.get("n") or 0) + 1}
+
+    def _record_round_uses(self) -> list[str]:
+        """Copy this main round's Reroll and Back use into the stored progress; ["uses"] when that changed it."""
+        state = self.state
+        if state.practice:
+            return []
+        state.sync_target_reroll_counter()
+        state.sync_back_counter()
+        uses = {"round": state.round_index, "rerolls": state.target_rerolls_used, "backs": state.backs_used}
+        current = state.progress_entries.get("uses")
+        if current == uses or (current and current["round"] > uses["round"]):
+            return []
+        state.progress_entries["uses"] = uses
+        return ["uses"]
+
+    async def _request_progress_from_storage(self) -> None:
+        if self.ws is None or not self.state.connected_to_ap or self.state.practice:
+            return
+        self.state.progress_storage_ready = False
+        key = self._progress_storage_key()
         payload = [
             {"cmd": "SetNotify", "keys": [key]},
             {"cmd": "Get", "keys": [key]},
@@ -2224,50 +2955,62 @@ class APConnection:
             async with self.send_lock:
                 await self.ws.send(json.dumps(payload))
         except Exception as exc:
-            LOG.info("Travel DataStorage Get/SetNotify request failed: %s", exc)
+            LOG.info("Progress DataStorage Get/SetNotify request failed: %s", exc)
 
-    async def _apply_travel_storage_payload(self, raw: Any, *, source: str = "") -> None:
-        if self.state.practice:
-            self.state.travel_storage_ready = True
+    async def _apply_progress_storage_payload(self, raw: Any, owner: str) -> None:
+        """Merge the stored progress (Get reply, or any device's write) into this bridge's copy, put rerolled
+        targets in place, and write back what storage lacks (progress made while it was unreachable, or a race)."""
+        state = self.state
+        if state.practice or owner != state.progress_owner:
             return
-        incoming_events, incoming_visits = self._parse_travel_storage_payload(raw)
-        self._merge_travel_state(incoming_events, incoming_visits)
-        self.state.travel_storage_ready = True
-        merged_events, merged_visits = self.state.travel_events, self.state.visit_counts
-        incoming_keys = {self._travel_event_key(item) for item in incoming_events}
-        merged_keys = {self._travel_event_key(item) for item in merged_events if isinstance(item, dict)}
-        visits_changed = any(
-            int(merged_visits.get(title, 0) or 0) > int(incoming_visits.get(title, 0) or 0)
-            for title in set(merged_visits) | set(incoming_visits)
-        )
-        if merged_keys != incoming_keys or visits_changed:
-            await self._persist_travel(force=True)
+        stored = self._parse_progress_payload(raw)
+        behind: list[str] = []
+        moved = False
+        for key in sorted(set(stored) | set(state.progress_entries)):
+            mine = state.progress_entries.get(key)
+            merged = self._merge_progress_entry(key, mine, stored.get(key))
+            if merged != mine:
+                state.progress_entries[key] = merged
+                if merged.get("target") and merged.get("target") != (mine or {}).get("target"):
+                    moved = self._apply_stored_target(key, merged["target"]) or moved
+            if merged != stored.get(key):
+                behind.append(key)
+        state.progress_storage_ready = True
+        state.sync_target_reroll_counter()
+        state.sync_back_counter()
+        state.target_rerolls_used = max(state.target_rerolls_used, state.stored_round_uses("rerolls"))
+        state.backs_used = max(state.backs_used, state.stored_round_uses("backs"))
+        if behind:
+            await self._persist_progress(behind)
+        if moved:
+            # Another device rerolled: the new targets have no Compass history yet.
+            self._schedule_compass(state.last_page)
 
-    async def _persist_travel(self, *, force: bool = False) -> None:
-        if self.state.practice or self.ws is None or not self.state.connected_to_ap:
+    async def _persist_progress(self, keys: list[str]) -> None:
+        """Write these entries of the stored progress. "update" replaces only the keys sent, so devices writing
+        different rounds can't overwrite each other's."""
+        state = self.state
+        if state.practice or self.ws is None or not state.connected_to_ap:
             return
-        if not force and not self.state.travel_storage_ready:
+        # Writing before the Get reply was merged would replace what other devices stored.
+        if not state.progress_storage_ready:
             return
-        key = self._travel_storage_key()
-        value = {
-            "events": list(self.state.travel_events),
-            "visit_counts": dict(self.state.visit_counts),
-        }
+        value = {key: state.progress_entries[key] for key in keys if key in state.progress_entries}
+        if not value:
+            return
+        key = self._progress_storage_key()
         payload = [{
             "cmd": "Set",
             "key": key,
-            "default": {"events": [], "visit_counts": {}},
+            "default": {},
             "want_reply": True,
-            "operations": [{
-                "operation": "replace",
-                "value": value,
-            }],
+            "operations": [{"operation": "update", "value": value}],
         }]
         try:
             async with self.send_lock:
                 await self.ws.send(json.dumps(payload))
         except Exception as exc:
-            LOG.info("Travel DataStorage Set failed for %s: %s", key, exc)
+            LOG.info("Progress DataStorage Set failed for %s: %s", key, exc)
 
     async def _append_travel_event(
         self,
@@ -2286,10 +3029,13 @@ class APConnection:
         self.state.travel_events.append(event)
         if len(self.state.travel_events) > MAX_TRAVEL_EVENTS:
             self.state.travel_events = self.state.travel_events[-MAX_TRAVEL_EVENTS:]
+        visited = ""
         if event["kind"] == "nav" and event["title"]:
             key = event["title"]
-            self.state.visit_counts[key] = int(self.state.visit_counts.get(key, 0) or 0) + 1
-        await self._persist_travel()
+            if key in self.state.visit_counts or len(self.state.visit_counts) < MAX_TRAVEL_EVENTS:
+                self.state.visit_counts[key] = int(self.state.visit_counts.get(key, 0) or 0) + 1
+                visited = key
+        await self._send_travel_step(event, visited)
 
     def _set_active_pair_target(self, new_target: str) -> bool:
         title = str(new_target or "").strip()
@@ -2437,7 +3183,7 @@ class APConnection:
 
     def _canonicalize_title_sync(self, title: str) -> str:
         norm = normalize_title(title)
-        cached = self.resolved_title_cache.get(norm)
+        cached = cache_get(self.resolved_title_cache, norm)
         if cached:
             return cached
 
@@ -2447,8 +3193,8 @@ class APConnection:
         except Exception:
             resolved = canonical
 
-        self.resolved_title_cache[norm] = resolved
-        self.resolved_title_cache[normalize_title(resolved)] = resolved
+        cache_put(self.resolved_title_cache, norm, resolved, TITLE_CACHE_SIZE)
+        cache_put(self.resolved_title_cache, normalize_title(resolved), resolved, TITLE_CACHE_SIZE)
         return resolved
 
     async def _canonicalize_title(self, title: str) -> str:
@@ -2470,7 +3216,7 @@ class APConnection:
 
     def _fetch_page_links(self, title: str) -> set[str]:
         norm = normalize_title(title)
-        cached = self.link_cache.get(norm)
+        cached = cache_get(self.link_cache, norm)
         if cached is not None:
             return cached
 
@@ -2491,17 +3237,7 @@ class APConnection:
             if plcontinue:
                 params["plcontinue"] = plcontinue
 
-            url = f"{self._wikipedia_api_root()}/w/api.php?" + urllib.parse.urlencode(params)
-            req = urllib.request.Request(
-                url,
-                headers={
-                    "User-Agent": "WikipelagoBridge/1.0 (local bridge)",
-                    "Accept": "application/json",
-                },
-            )
-            with urllib.request.urlopen(req, timeout=8) as response:
-                payload = json.loads(response.read().decode("utf-8"))
-
+            payload = self._wiki_api_json(params)
             pages = payload.get("query", {}).get("pages", {})
             for page_data in pages.values():
                 for link in page_data.get("links", []):
@@ -2514,30 +3250,82 @@ class APConnection:
             if not plcontinue:
                 break
 
-        self.link_cache[norm] = links
+        cache_put(self.link_cache, norm, links, LINK_CACHE_SIZE)
         return links
 
     def _wikipedia_api_root(self) -> str:
-        lang = (self.state.wikipedia_language or "en").strip().lower() or "en"
+        lang = wiki_language(self.state.wikipedia_language) or "en"
         return f"https://{lang}.wikipedia.org"
 
-    async def _estimate_click_distance(self, page_title: str, target_title: str) -> int | None:
-        page_norm = normalize_title(page_title)
+    def _wiki_api_json(self, params: dict[str, str]) -> dict[str, Any]:
+        url = f"{self._wikipedia_api_root()}/w/api.php?" + urllib.parse.urlencode(params)
+        req = urllib.request.Request(
+            url,
+            headers={
+                "User-Agent": WIKI_USER_AGENT,
+                "Accept": "application/json",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=8) as response:
+            body = response.read(WIKI_MAX_RESPONSE_BYTES + 1)
+        if len(body) > WIKI_MAX_RESPONSE_BYTES:
+            raise ValueError("Wikipedia response too large")
+        payload = json.loads(body.decode("utf-8"))
+        return payload if isinstance(payload, dict) else {}
+
+    def _fetch_backlinks(self, title: str) -> tuple[set[str], set[str]]:
+        """(articles linking to `title`, redirects to `title`), capped for very popular pages."""
+        norm = normalize_title(title)
+        cached = cache_get(self.backlink_cache, norm)
+        if cached is not None:
+            return cached
+
+        backlinks: set[str] = set()
+        redirects: set[str] = set()
+        blcontinue: str | None = None
+        for _ in range(COMPASS_BACKLINK_PAGES):
+            params: dict[str, str] = {
+                "action": "query",
+                "list": "backlinks",
+                "bltitle": title,
+                "blnamespace": "0",
+                "blredirect": "1",
+                "bllimit": "max",
+                "format": "json",
+            }
+            if blcontinue:
+                params["blcontinue"] = blcontinue
+
+            payload = self._wiki_api_json(params)
+            for entry in payload.get("query", {}).get("backlinks", []):
+                entry_title = str(entry.get("title", "")).strip()
+                if entry_title:
+                    (redirects if "redirect" in entry else backlinks).add(normalize_title(entry_title))
+                for sub in entry.get("redirlinks", []) or []:
+                    sub_title = str(sub.get("title", "")).strip()
+                    if sub_title:
+                        backlinks.add(normalize_title(sub_title))
+
+            blcontinue = payload.get("continue", {}).get("blcontinue")
+            if not blcontinue:
+                break
+
+        cache_put(self.backlink_cache, norm, (backlinks, redirects), BACKLINK_CACHE_SIZE)
+        return backlinks, redirects
+
+    def _compass_reading(self, page_title: str, page_links: set[str], target_title: str) -> tuple[int, int]:
+        """(level, overlap) of a page against one target. Level 0: on it; 1: linked from the page;
+        2: two clicks away; 3: farther. Overlap counts the page's links into the target's
+        neighbourhood (pages linking to it or linked from it); higher is closer."""
         target_norm = normalize_title(target_title)
-        if page_norm == target_norm:
-            return 0
-
-        try:
-            page_links = await asyncio.to_thread(self._fetch_page_links, page_title)
-            if target_norm in page_links:
-                return 1
-
-            target_links = await asyncio.to_thread(self._fetch_page_links, target_title)
-            if page_links.intersection(target_links):
-                return 2
-            return 3
-        except Exception:
-            return None
+        if normalize_title(page_title) == target_norm:
+            return (0, 0)
+        backlinks, redirects = self._fetch_backlinks(target_title)
+        if target_norm in page_links or page_links & redirects:
+            return (1, 0)
+        target_links = self._fetch_page_links(target_title)
+        overlap = len(page_links & (backlinks | target_links))
+        return (2 if page_links & backlinks else 3, overlap)
 
 
     def _fetch_resolved_title(self, title: str) -> str:
@@ -2547,17 +3335,7 @@ class APConnection:
             "redirects": "1",
             "format": "json",
         }
-        url = f"{self._wikipedia_api_root()}/w/api.php?" + urllib.parse.urlencode(params)
-        req = urllib.request.Request(
-            url,
-            headers={
-                "User-Agent": "WikipelagoBridge/1.0 (local bridge)",
-                "Accept": "application/json",
-            },
-        )
-        with urllib.request.urlopen(req, timeout=8) as response:
-            payload = json.loads(response.read().decode("utf-8"))
-
+        payload = self._wiki_api_json(params)
         pages = payload.get("query", {}).get("pages", {})
         for page_data in pages.values():
             resolved = str(page_data.get("title", "")).strip()
@@ -2579,38 +3357,61 @@ class APConnection:
         if target_norm in page_aliases:
             return True
 
+        # Cached (callers have usually just canonicalised both titles), so a click with several live targets
+        # doesn't ask Wikipedia about the same two pages again for each one.
         try:
-            resolved_page = await asyncio.to_thread(self._fetch_resolved_title, page_title)
-            resolved_target = await asyncio.to_thread(self._fetch_resolved_title, target_title)
+            resolved_page = await self._canonicalize_title(page_title)
+            resolved_target = await self._canonicalize_title(target_title)
             return normalize_title(resolved_page) == normalize_title(resolved_target)
         except Exception:
             return False
 
-    async def _update_compass_hint(self, page_title: str, target_title: str) -> None:
-        if not self.state.has_item("Wiki Compass"):
-            self.state.warmer_colder = None
-            self.state.last_distance_estimate = None
+    def _schedule_compass(self, page_title: str) -> None:
+        """Refresh the Wiki Compass in the background so checks never wait on Wikipedia;
+        the status poll picks the new hint up."""
+        if not page_title or not self.state.is_playable():
+            return
+        self._compass_seq += 1
+        task = asyncio.create_task(self._update_compass(page_title, self._compass_seq))
+        self._compass_tasks.add(task)
+        task.add_done_callback(self._compass_tasks.discard)
+
+    async def _update_compass(self, page_title: str, seq: int) -> None:
+        state = self.state
+        if not state.has_item("Wiki Compass"):
+            state.reset_compass()
+            return
+        targets = state.compass_targets()
+        if not targets:
+            state.warmer_colder = None
+            state.compass_target = None
             return
 
-        estimate = await self._estimate_click_distance(page_title, target_title)
-        if estimate is None:
-            self.state.warmer_colder = "No signal"
-            return
-        if estimate == 0:
-            self.state.warmer_colder = "On target"
-            self.state.last_distance_estimate = 0
+        readings: list[tuple[dict[str, Any], tuple[int, int]]] = []
+        try:
+            page = await self._canonicalize_title(page_title)
+            page_links = await asyncio.to_thread(self._fetch_page_links, page)
+        except Exception:
+            page_links = None
+        if page_links is not None:
+            for target in targets:
+                try:
+                    reading = await asyncio.to_thread(self._compass_reading, page, page_links, target["title"])
+                except Exception:
+                    continue
+                readings.append((target, reading))
+
+        if seq != self._compass_seq:
+            return  # The player already moved on; the newer reading wins.
+        if not readings:
+            state.warmer_colder = "No signal"
             return
 
-        previous = self.state.last_distance_estimate
-        if previous is None:
-            self.state.warmer_colder = "Calibrating"
-        elif estimate < previous:
-            self.state.warmer_colder = "Warmer"
-        elif estimate > previous:
-            self.state.warmer_colder = "Colder"
-        else:
-            self.state.warmer_colder = "Same"
-        self.state.last_distance_estimate = estimate
+        # Point at the nearest live target, compared with that target's own previous reading.
+        target, reading = min(readings, key=lambda item: (item[1][0], -item[1][1]))
+        state.warmer_colder = compass_hint(state.compass_memory.get(normalize_title(target["title"])), reading)
+        state.compass_target = target
+        state.compass_memory = {normalize_title(t["title"]): r for t, r in readings}
 
     async def send_goal_status(self) -> None:
         if self.ws is None:
@@ -2650,13 +3451,24 @@ class APConnection:
 
         self.state.merge_clicks(clicks_used)
         await self._persist_clicks()
+        # Two checks can run at once (a double-click on a link). Remember which round this one is
+        # about, so only the first can complete it and the second can't also complete the next.
+        main_index = self.state.round_index
+        raw_target = self.state.current_target()
         page_title = await self._canonicalize_title(page_title)
         self._remember_page(page_title)
 
-        target = await self._canonicalize_title(self.state.current_target())
-        self._set_active_pair_target(target)
-        await self._update_compass_hint(page_title, target)
-        matched_main = await self._titles_match(page_title, target)
+        if raw_target:
+            target = await self._canonicalize_title(raw_target)
+            if self.state.round_index == main_index:
+                self._set_active_pair_target(target)
+            matched_main = await self._titles_match(page_title, target)
+            if self.state.round_index != main_index or self.state.current_target() != target:
+                matched_main = False
+        else:
+            # Realm Master after the last main round: only Realm targets remain.
+            target = ""
+            matched_main = False
 
         result: dict[str, Any] = {
             "matched": matched_main,
@@ -2668,13 +3480,40 @@ class APConnection:
         }
 
         if self.state.practice:
+            hits: list[dict[str, Any]] = []
             if matched_main:
-                await self._append_travel_event("round_complete", page_title, extra={"path": "main"})
                 # Chain like AP: keep the player on the cleared target; only roll a new target.
+                # Roll before awaiting anything, so a concurrent check no longer matches the old target.
                 self._roll_practice_race(continue_from=page_title)
+                await self._append_travel_event("round_complete", page_title, extra={"path": "main"})
                 result["advanced"] = True
                 result["practice_rolled"] = True
-                result["hits"] = [{"kind": "main", "target": target}]
+                hits.append({"kind": "main", "target": target})
+            for bid in list(self.state.unlocked_branch_ids()):
+                raw_branch_target = self.state.branch_current_target(bid)
+                if not raw_branch_target:
+                    continue
+                branch_target = await self._canonicalize_title(raw_branch_target)
+                if not await self._titles_match(page_title, branch_target):
+                    continue
+                if self.state.branch_current_target(bid) != raw_branch_target:
+                    continue
+                idx = int(self.state.branch_round_index.get(bid, 0) or 0)
+                self.state.branch_round_index[bid] = idx + 1
+                branch = self.state.branch_by_id(bid) or {}
+                hits.append({
+                    "kind": "branch",
+                    "branch_id": bid,
+                    "fork": bid + 1,
+                    "target": branch_target,
+                    "round": idx + 1,
+                    "theme_tag": str(branch.get("theme_tag") or ""),
+                })
+                result["advanced"] = True
+                await self._append_travel_event("round_complete", page_title, extra={"path": f"branch:{bid}"})
+            result["hits"] = hits
+            result["matched"] = bool(hits)
+            self._schedule_compass(page_title)
             result["status"] = self.state.to_status()
             result["next_target"] = self.state.current_target()
             return result
@@ -2687,10 +3526,16 @@ class APConnection:
             if round_number > self.state.unlocked_rounds():
                 result["locked"] = True
             else:
-                round_id = self.state.location_round_ids[self.state.round_index]
-                scouted = await self.scout_locations([round_id])
-                await self.send_location_checks([round_id])
-                self.state.round_index += 1
+                round_id = self.state.location_round_ids[main_index]
+                # Claim the round before awaiting, so a concurrent check sees it as done.
+                self.state.round_index = main_index + 1
+                try:
+                    scouted = await self.scout_locations([round_id])
+                    await self.send_location_checks([round_id])
+                except Exception:
+                    if self.state.round_index == main_index + 1:
+                        self.state.round_index = main_index
+                    raise
                 self.state.sync_target_reroll_counter()
                 self.state.sync_back_counter()
                 result["advanced"] = True
@@ -2712,10 +3557,17 @@ class APConnection:
             branch_target = await self._canonicalize_title(self.state.branch_current_target(bid))
             if not branch_target or not await self._titles_match(page_title, branch_target):
                 continue
+            if int(self.state.branch_round_index.get(bid, 0) or 0) != idx:
+                continue  # a concurrent check already completed this Realm round
             loc_id = loc_ids[idx]
-            scouted = await self.scout_locations([loc_id])
-            await self.send_location_checks([loc_id])
             self.state.branch_round_index[bid] = idx + 1
+            try:
+                scouted = await self.scout_locations([loc_id])
+                await self.send_location_checks([loc_id])
+            except Exception:
+                if self.state.branch_round_index.get(bid) == idx + 1:
+                    self.state.branch_round_index[bid] = idx
+                raise
             result["advanced"] = True
             result["matched"] = True
             hit = {
@@ -2748,6 +3600,8 @@ class APConnection:
 
         await self.try_finish_boss()
         await self.ensure_goal_status_if_complete()
+        # After any round advance, so a new target starts at "Calibrating" instead of reusing old readings.
+        self._schedule_compass(page_title)
         result["status"] = self.state.to_status()
         result["next_target"] = self.state.current_target()
         return result
@@ -2758,13 +3612,14 @@ class APConnection:
 
         if not self.state.is_playable():
             return {"ok": False, "error": "not connected", "status": self.state.to_status()}
-        if self.state.boss_completed:
-            return {"ok": False, "error": "seed already complete", "status": self.state.to_status()}
+        if not self.state.progress_ready():
+            return {"ok": False, "error": "progress not loaded yet", "status": self.state.to_status()}
+        # After the goal, rounds whose checks are still open (no-release rooms) can still be rerolled.
         slots = self.state.rerollable_target_slots()
         if not slots:
             return {
                 "ok": False,
-                "error": "cannot reroll the Grand Goal",
+                "error": "seed already complete" if self.state.boss_completed else "cannot reroll the Grand Goal",
                 "status": self.state.to_status(),
             }
         if self.state.target_rerolls_remaining() <= 0:
@@ -2777,19 +3632,6 @@ class APConnection:
         def _norm(title: str) -> str:
             return str(title or "").replace("_", " ").strip().casefold()
 
-        def _title_still_used(title: str) -> bool:
-            needle = _norm(title)
-            if not needle:
-                return False
-            for pair in self.state.round_pairs:
-                if _norm(pair.get("target", "")) == needle:
-                    return True
-            for branch in self.state.branches:
-                for pair in (branch.get("pairs") or []):
-                    if isinstance(pair, dict) and _norm(pair.get("target", "")) == needle:
-                        return True
-            return False
-
         start = self.state.current_start()
         blocked = {_norm(start), _norm(self.state.goal_article())}
         for pair in self.state.round_pairs:
@@ -2801,8 +3643,11 @@ class APConnection:
 
         pool = list(self.state.reroll_pool)
 
-        async def _pick(blocked_titles: set[str]) -> tuple[str, str] | None:
-            candidates = [title for title in pool if _norm(title) not in blocked_titles]
+        async def _pick(blocked_titles: set[str], only: set[str] | None = None) -> tuple[str, str] | None:
+            candidates = [
+                title for title in pool
+                if _norm(title) not in blocked_titles and (only is None or _norm(title) in only)
+            ]
             if not candidates:
                 return None
             picked = random.choice(candidates)
@@ -2818,7 +3663,16 @@ class APConnection:
 
         picks: list[tuple[dict[str, Any], str, str]] = []
         for slot in slots:
-            chosen = await _pick(blocked)
+            realm_titles: set[str] | None = None
+            if slot.get("kind") == "branch":
+                realm = self.state.branch_by_id(int(slot.get("branch_id") or 0)) or {}
+                realm_pool = realm.get("reroll_pool")
+                if isinstance(realm_pool, list) and realm_pool:
+                    realm_titles = {_norm(title) for title in realm_pool}
+            chosen = await _pick(blocked, realm_titles) if realm_titles else None
+            if not chosen:
+                # Off-topic fallback once a Realm's own slice runs dry.
+                chosen = await _pick(blocked)
             if not chosen:
                 return {
                     "ok": False,
@@ -2833,13 +3687,19 @@ class APConnection:
 
         changes: list[dict[str, Any]] = []
         recycled: list[str] = []
+        stored_keys: list[str] = []
         for slot, picked, new_target in picks:
             old_target = str(slot.get("old_target") or "")
             if slot.get("kind") == "branch":
-                if not self._set_branch_pair_target(int(slot.get("branch_id") or 0), new_target):
+                bid = int(slot.get("branch_id") or 0)
+                if not self._set_branch_pair_target(bid, new_target):
                     return {"ok": False, "error": "no active branch round", "status": self.state.to_status()}
-            elif not self._set_active_pair_target(new_target):
-                return {"ok": False, "error": "no active round", "status": self.state.to_status()}
+                stored_keys.append(f"branch:{bid}:{int(self.state.branch_round_index.get(bid, 0) or 0)}")
+            else:
+                if not self._set_active_pair_target(new_target):
+                    return {"ok": False, "error": "no active round", "status": self.state.to_status()}
+                stored_keys.append(f"main:{self.state.round_index}")
+            self._remember_rerolled_target(stored_keys[-1], new_target)
             change = {
                 "kind": str(slot.get("kind") or "main"),
                 "old_target": old_target,
@@ -2851,18 +3711,24 @@ class APConnection:
             changes.append(change)
             if old_target and _norm(old_target) != _norm(self.state.goal_article()):
                 recycled.append(old_target)
+                if slot.get("kind") == "branch":
+                    realm = self.state.branch_by_id(int(slot.get("branch_id") or 0)) or {}
+                    realm_pool = realm.get("reroll_pool")
+                    if isinstance(realm_pool, list) and all(_norm(t) != _norm(old_target) for t in realm_pool):
+                        realm_pool.append(old_target)
 
         for old_target in recycled:
-            if _title_still_used(old_target):
+            if self.state.target_in_use(old_target):
                 continue
             if all(_norm(title) != _norm(old_target) for title in pool):
                 pool.append(old_target)
 
         self.state.reroll_pool = pool
         self.state.target_rerolls_used += 1
-        if any(change.get("kind") == "main" for change in changes):
-            self.state.warmer_colder = None
-            self.state.last_distance_estimate = None
+        if not self.state.practice:
+            await self._persist_progress(stored_keys + self._record_round_uses())
+        # New targets have no Compass history yet: recalibrate on the page the player is on.
+        self._schedule_compass(self.state.last_page)
 
         main_change = next((item for item in changes if item.get("kind") == "main"), None)
         first = main_change or (changes[0] if changes else {})
@@ -2884,6 +3750,8 @@ class APConnection:
 
         if not self.state.is_playable():
             return {"ok": False, "error": "not connected", "status": self.state.to_status()}
+        if not self.state.progress_ready():
+            return {"ok": False, "error": "progress not loaded yet", "status": self.state.to_status()}
         if not self.state.can_go_back():
             return {
                 "ok": False,
@@ -2892,6 +3760,7 @@ class APConnection:
             }
 
         self.state.backs_used += 1
+        await self._persist_progress(self._record_round_uses())
         await self._append_travel_event("back", self.state.last_page)
         return {
             "ok": True,
@@ -2998,6 +3867,17 @@ class APConnection:
 
     async def try_finish_boss(self) -> None:
         if self.state.boss_completed:
+            return
+        if self.state.is_realm_master():
+            if not self.state.realm_master_met():
+                return
+            self.state.boss_completed = True
+            await self.send_goal_status()
+            await self._append_travel_event(
+                "realm_master",
+                self.state.last_page,
+                extra={"path": "main"},
+            )
             return
         if not self.state.boss_ready():
             return
@@ -3144,8 +4024,7 @@ class APConnection:
                 self.state.round_index = min(target_index, self.state.check_count)
                 self.state.sync_target_reroll_counter()
                 self.state.sync_back_counter()
-                self.state.warmer_colder = None
-                self.state.last_distance_estimate = None
+                self.state.reset_compass()
                 await self.try_finish_boss()
                 out: dict[str, Any] = {
                     "ok": True,
@@ -3172,7 +4051,12 @@ class APConnection:
                 }
 
             if action == "unlock_all_branches":
-                need = max(0, len(self.state.branches))
+                if self.state.topic_portals:
+                    for branch in self.state.branches:
+                        portal = str(branch.get("portal_item") or "")
+                        if portal and not self.state.has_item(portal):
+                            await self._debug_grant_named(portal, unique=True, fire_trap=False)
+                need = 0 if self.state.topic_portals else max(0, len(self.state.branches))
                 while self.state.item_count("Branch Key") < need:
                     await self._debug_grant_named("Branch Key", unique=False, fire_trap=False)
                 return {
@@ -3257,8 +4141,7 @@ class APConnection:
                 new_target = await self._canonicalize_title(title)
                 if not self._set_active_pair_target(new_target):
                     return {"ok": False, "error": "no active round", "status": self.state.to_status()}
-                self.state.warmer_colder = None
-                self.state.last_distance_estimate = None
+                self.state.reset_compass()
                 return {
                     "ok": True,
                     "action": action,
@@ -3269,11 +4152,13 @@ class APConnection:
             if action == "reset_rerolls":
                 self.state.target_rerolls_used = 0
                 self.state.target_rerolls_round = self.state.progress_key()
+                await self._persist_progress(self._record_round_uses())
                 return {"ok": True, "action": action, "status": self.state.to_status()}
 
             if action == "reset_backs":
                 self.state.backs_used = 0
                 self.state.backs_round = self.state.progress_key()
+                await self._persist_progress(self._record_round_uses())
                 return {"ok": True, "action": action, "status": self.state.to_status()}
 
             if action == "set_options":
@@ -3310,7 +4195,25 @@ class APConnection:
                 self._queue_event({"type": "death", "source": "Debug", "cause": cause})
                 return {"ok": True, "action": action, "status": self.state.to_status()}
 
+            if action == "complete_branch_rounds":
+                # Advance every live Realm / branch by one round (sends real checks).
+                completed: list[dict[str, Any]] = []
+                for bid in list(self.state.unlocked_branch_ids()):
+                    idx = int(self.state.branch_round_index.get(bid, 0) or 0)
+                    result = await self._debug_complete_branch_at(bid, idx)
+                    if result.get("advanced"):
+                        completed.append(result)
+                await self.try_finish_boss()
+                await self.ensure_goal_status_if_complete()
+                if not completed:
+                    return {"ok": False, "error": "no live branch rounds", "status": self.state.to_status()}
+                return {"ok": True, "action": action, "completed": completed, "status": self.state.to_status()}
+
             if action == "finish_boss":
+                if self.state.is_realm_master():
+                    self.state.boss_completed = True
+                    await self.send_goal_status()
+                    return {"ok": True, "action": action, "status": self.state.to_status()}
                 self._debug_set_item_count("Knowledge Fragment", max(self.state.required_fragments, self.state.fragments()))
                 if self.state.location_grand_goal:
                     await self.send_location_checks([self.state.location_grand_goal])
@@ -3329,18 +4232,48 @@ class Session:
     id: str
     state: SessionState
     conn: APConnection
+    client: str = ""
 
 
 class SessionManager:
     def __init__(self):
         self.sessions: dict[str, Session] = {}
 
-    def create(self) -> Session:
+    def create(self, client: str = "") -> Session | None:
+        """A new session, or None when this client or the whole server has too many active ones."""
+        self._make_room(client)
+        mine = sum(1 for session in self.sessions.values() if client and session.client == client)
+        if len(self.sessions) >= MAX_SESSIONS or mine >= MAX_SESSIONS_PER_CLIENT:
+            return None
         sid = uuid.uuid4().hex
         state = SessionState()
-        session = Session(id=sid, state=state, conn=APConnection(state))
+        session = Session(id=sid, state=state, conn=APConnection(state), client=client)
         self.sessions[sid] = session
         return session
+
+    def _make_room(self, client: str) -> None:
+        """Drop idle sessions of this client, then idle ones anywhere if the server is full."""
+        now = time.time()
+        idle = sorted(
+            (s for s in self.sessions.values() if now - s.state.last_seen > SESSION_RECLAIM_IDLE_SECONDS),
+            key=lambda s: s.state.last_seen,
+        )
+        mine = [s for s in self.sessions.values() if client and s.client == client]
+        for session in idle:
+            if not client or session.client != client or len(mine) < MAX_SESSIONS_PER_CLIENT:
+                continue
+            self.drop(session.id)
+            mine.remove(session)
+        for session in idle:
+            if len(self.sessions) < MAX_SESSIONS:
+                break
+            if session.id in self.sessions:
+                self.drop(session.id)
+
+    def drop(self, sid: str) -> None:
+        session = self.sessions.pop(sid, None)
+        if session and session.conn.reader_task and not session.conn.reader_task.done():
+            session.conn.reader_task.cancel()
 
     def get(self, sid: str) -> Session | None:
         session = self.sessions.get(sid)
@@ -3353,19 +4286,31 @@ class SessionManager:
             now = time.time()
             stale = [sid for sid, session in self.sessions.items() if now - session.state.last_seen > SESSION_TTL_SECONDS]
             for sid in stale:
-                session = self.sessions.pop(sid)
-                if session.conn.reader_task and not session.conn.reader_task.done():
-                    session.conn.reader_task.cancel()
+                self.drop(sid)
             await asyncio.sleep(120)
 
 class App:
     def __init__(self, web_root: Path):
         self.web_root = web_root
         self.sessions = SessionManager()
+        self._announcement = ""
+        self._announcement_checked = 0.0
+
+    def announcement(self) -> str:
+        """Text of announcement.txt, re-read at most every few seconds (every page polls status every 1.5s)."""
+        now = time.monotonic()
+        if now - self._announcement_checked >= ANNOUNCEMENT_RECHECK_SECONDS:
+            self._announcement_checked = now
+            try:
+                with ANNOUNCEMENT_FILE.open("rb") as handle:
+                    raw = handle.read(ANNOUNCEMENT_MAX_CHARS * 4)
+                self._announcement = raw.decode("utf-8-sig", "replace").strip()[:ANNOUNCEMENT_MAX_CHARS]
+            except OSError:
+                self._announcement = ""
+        return self._announcement
 
     async def index(self, request: web.Request) -> web.StreamResponse:
-        # Embed deploy identity in HTML so the badge does not depend on a separate
-        # /health fetch (Render free-tier cold starts often 404 that first request).
+        # Embed deploy identity in HTML so the badge does not depend on a separate /health fetch.
         html = (self.web_root / "index.html").read_text(encoding="utf-8")
         payload = json.dumps(build_info(), separators=(",", ":"))
         injection = f'<script type="application/json" id="build-info">{payload}</script>\n'
@@ -3402,7 +4347,9 @@ class App:
         return web.json_response(info)
 
     async def create_session(self, request: web.Request) -> web.StreamResponse:
-        session = self.sessions.create()
+        session = self.sessions.create(client_address(request))
+        if session is None:
+            return web.json_response({"ok": False, "error": "Too many open sessions. Close some tabs and try again."}, status=503)
         return web.json_response({"ok": True, "session_id": session.id})
 
     async def connect_session(self, request: web.Request) -> web.StreamResponse:
@@ -3411,15 +4358,21 @@ class App:
         if not session:
             return web.json_response({"ok": False, "error": "invalid session"}, status=404)
 
-        data = await request.json()
+        data = await read_json_body(request)
         server = str(data.get("server", "")).strip()
         slot_name = str(data.get("slot_name", "")).strip()
         password = str(data.get("password", "")).strip()
 
         if not server or not slot_name:
             return web.json_response({"ok": False, "error": "server and slot_name are required"}, status=400)
+        if len(server) > 255 or len(slot_name) > 64 or len(password) > 256:
+            return web.json_response({"ok": False, "error": "server, slot name or password is too long"}, status=400)
+        allow_private = is_local_request(request)
+        address_error = await ap_server_address_error(server, allow_private)
+        if address_error:
+            return web.json_response({"ok": False, "error": address_error}, status=400)
 
-        await session.conn.connect(server, slot_name, password)
+        await session.conn.connect(server, slot_name, password, allow_private=allow_private)
         return web.json_response({"ok": True})
 
     async def practice_session(self, request: web.Request) -> web.StreamResponse:
@@ -3440,6 +4393,20 @@ class App:
             return web.json_response({"ok": False, "error": str(exc)}, status=400)
         return web.json_response(result)
 
+    async def practice_new_board(self, request: web.Request) -> web.StreamResponse:
+        session = self.sessions.get(request.match_info["sid"])
+        if not session:
+            return web.json_response({"ok": False, "error": "invalid session"}, status=404)
+        result = await session.conn.new_practice_board()
+        return web.json_response(result, status=200 if result.get("ok") else 400)
+
+    async def practice_new_realm(self, request: web.Request) -> web.StreamResponse:
+        session = self.sessions.get(request.match_info["sid"])
+        if not session:
+            return web.json_response({"ok": False, "error": "invalid session"}, status=404)
+        result = await session.conn.new_practice_realm()
+        return web.json_response(result, status=200 if result.get("ok") else 400)
+
     async def disconnect_session(self, request: web.Request) -> web.StreamResponse:
         sid = request.match_info["sid"]
         session = self.sessions.get(sid)
@@ -3454,9 +4421,10 @@ class App:
         if not session:
             return web.json_response({"ok": False, "error": "invalid session"}, status=404)
         status = session.state.to_status()
-        events = session.conn.take_pending_events()
-        status["pending_events"] = events
-        return web.json_response({"ok": True, "status": status})
+        # The Journey pop-out window polls with ?peek=1 so it never takes the main window's deaths and traps.
+        if request.query.get("peek") != "1":
+            status["pending_events"] = session.conn.take_pending_events()
+        return web.json_response({"ok": True, "status": status, "announcement": self.announcement()})
 
     async def session_death(self, request: web.Request) -> web.StreamResponse:
         sid = request.match_info["sid"]
@@ -3465,8 +4433,8 @@ class App:
             return web.json_response({"ok": False, "error": "invalid session"}, status=404)
         if not session.state.connected_to_ap:
             return web.json_response({"ok": False, "error": "not connected"}, status=400)
-        data = await request.json()
-        cause = str(data.get("cause") or "").strip()
+        data = await read_json_body(request)
+        cause = str(data.get("cause") or "").strip()[:200]
         await session.conn.send_death_link(cause)
         return web.json_response({"ok": True})
 
@@ -3476,9 +4444,12 @@ class App:
         if not session:
             return web.json_response({"ok": False, "error": "invalid session"}, status=404)
 
-        data = await request.json()
+        data = await read_json_body(request)
         page_title = str(data.get("page_title", "")).strip()
-        clicks_used = int(data.get("clicks_used", 0))
+        try:
+            clicks_used = max(0, int(data.get("clicks_used", 0)))
+        except (TypeError, ValueError):
+            clicks_used = 0
         # Strict mode: display/restore callers must not score. Only intentional
         # in-article clicks should send submit_check=true (client default).
         submit_check = bool(data.get("submit_check", True))
@@ -3488,13 +4459,15 @@ class App:
 
         if not page_title:
             return web.json_response({"ok": False, "error": "page_title is required"}, status=400)
+        if len(page_title) > MAX_TITLE_CHARS:
+            return web.json_response({"ok": False, "error": "page_title is too long"}, status=400)
 
         session.conn.state.last_seen = time.time()
         session.conn.state.merge_clicks(clicks_used)
         await session.conn._persist_clicks()
         session.conn._remember_page(page_title)
         bingo_completed: list[dict[str, Any]] = []
-        if session.state.connected_to_ap:
+        if session.state.connected_to_ap or session.state.practice:
             bingo_completed = await session.conn.apply_bingo_visit(page_title)
 
         if travel_kind == "nav":
@@ -3503,6 +4476,8 @@ class App:
             await session.conn._append_travel_event("death", page_title)
 
         if not submit_check:
+            # Back, death and restore still change the page the Compass reads.
+            session.conn._schedule_compass(page_title)
             return web.json_response({
                 "ok": True,
                 "matched": False,
@@ -3558,7 +4533,6 @@ class App:
             "events": payload.get("events") or [],
             "visit_counts": payload.get("visit_counts") or {},
             "paths": session.state.path_payload(),
-            "active_path": session.state.active_path or "main",
             "travel_storage_ready": session.state.travel_storage_ready,
         })
 
@@ -3626,7 +4600,7 @@ class App:
         return web.json_response(result, status=status_code)
 
     def build(self) -> web.Application:
-        app = web.Application()
+        app = web.Application(client_max_size=MAX_REQUEST_BYTES)
         app.router.add_get("/", self.index)
         app.router.add_get("/favicon.ico", self.favicon)
         app.router.add_get("/manifest.webmanifest", self.manifest)
@@ -3635,6 +4609,8 @@ class App:
         app.router.add_post("/api/session", self.create_session)
         app.router.add_post("/api/session/{sid}/connect", self.connect_session)
         app.router.add_post("/api/session/{sid}/practice", self.practice_session)
+        app.router.add_post("/api/session/{sid}/practice/new-board", self.practice_new_board)
+        app.router.add_post("/api/session/{sid}/practice/new-realm", self.practice_new_realm)
         app.router.add_post("/api/session/{sid}/disconnect", self.disconnect_session)
         app.router.add_get("/api/session/{sid}/status", self.session_status)
         app.router.add_post("/api/session/{sid}/death", self.session_death)
@@ -3676,7 +4652,7 @@ async def main_async(args: argparse.Namespace) -> None:
     site = web.TCPSite(runner, args.host, args.port)
     await site.start()
 
-    LOG.info(f"Wikipelago cloud app running on http://{args.host}:{args.port}")
+    LOG.info(f"Wikipelago bridge running on http://{args.host}:{args.port}")
     if debug_menu_enabled():
         LOG.info("Debug menu enabled (WIKIPELAGO_DEBUG_MENU)")
     while True:
@@ -3684,7 +4660,7 @@ async def main_async(args: argparse.Namespace) -> None:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Wikipelago cloud app")
+    parser = argparse.ArgumentParser(description="Wikipelago bridge")
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=int(os.environ.get("PORT", "5000")))
     parser.add_argument(
@@ -3704,21 +4680,3 @@ def launch() -> None:
 
 if __name__ == "__main__":
     launch()
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
